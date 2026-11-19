@@ -6,7 +6,7 @@
   "scripts": {
     "start": "electron .",
     "test": "node renderer/urgency.test.js",
-    "dist": "electron-builder --win nsis",
+    "dist": "electron-builder --win nsis --publish never",
     "install-app": "powershell -ExecutionPolicy Bypass -File install.ps1"
   },
   "build": {
