@@ -1,0 +1,11 @@
+{
+  "profiles": {
+    "GlassDeskDock (Package)": {
+      "commandName": "MsixPackage",
+      "doNotLaunchApp": true
+    },
+    "GlassDeskDock (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "name": "glassdesk",
+  "version": "0.1.0",
+  "description": "Workmate Desk: Gmail, Google Calendar, Asana and Everhour in one window",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node renderer/urgency.test.js",
+    "dist": "electron-builder --win nsis",
+    "install-app": "powershell -ExecutionPolicy Bypass -File install.ps1"
+  },
+  "build": {
+    "appId": "io.workmatedesk.app",
+    "productName": "Workmate Desk",
+    "files": [
+      "package.json",
+      "main.js",
+      "preload.js",
+      "ai.js",
+      "bridge.js",
+      "renderer/**",
+      "!renderer/*.test.js"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "Workmate Desk",
+      "uninstallDisplayName": "Workmate Desk",
+      "runAfterFinish": true,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "artifactName": "Workmate Desk Setup ${version}.${ext}"
+    }
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.7.0",
+    "zod": "^4.6.7"
+  }
+}
