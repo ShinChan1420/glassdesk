@@ -605,3 +605,16 @@ body.still .w-more svg { animation: none; }
 .fold.links .ctx-head svg:not(.chev) { color: var(--blue); }
 .count-pill { font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 999px; background: var(--fill); color: var(--text2); }
 .fold-body > .chips { margin-bottom: 4px; }
+
+/* mail accounts, Jira, Salesforce Cases */
+.src { display: inline-block; font-size: 10px; font-weight: 700; line-height: 15px; padding: 0 6px; border-radius: 5px; margin-right: 5px; color: #fff; vertical-align: 1px; }
+.src.google { background: #d93025; } .src.microsoft { background: #0f6cbd; }
+.mi-src { font-size: 11px; color: var(--text3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acct-pick { padding: 5px 28px 5px 10px; font-size: 12px; }
+.acct-row { justify-content: space-between; gap: 10px; } .acct-row > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+.row > .acct-btns { display: flex; gap: 6px; flex: none; }
+.badge.jira { background: linear-gradient(135deg, #2684ff, #0052cc); } .badge.sf { background: linear-gradient(135deg, #1ab0f0, #0b6fb7); }
+.cases { display: grid; grid-template-columns: var(--w-list, 340px) minmax(0, 1fr); gap: 12px; height: 100%; }
+#cases-list { padding: 0 8px 8px; }
+.status-grid .wide { width: 100%; } .status-grid .grow { flex: 1; min-width: 0; }
+@media (max-width: 760px) { .cases { grid-template-columns: 1fr; } }

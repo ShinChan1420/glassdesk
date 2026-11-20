@@ -1,10 +1,10 @@
 const { app, BrowserWindow, ipcMain, shell, safeStorage, screen, nativeTheme, dialog } = require('electron');
-const http = require('http');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const ai = require('./ai');
+const services = require('./services');
 // The app was called GlassDesk: keep its data folder (sign-ins, links, settings) under the new name.
 // WORKMATE_DATA_DIR lets tests run beside a real copy without touching (or locking) its data.
 app.setPath('userData', process.env.WORKMATE_DATA_DIR || path.join(app.getPath('appData'), 'glassdesk'));
@@ -15,11 +15,6 @@ app.setPath('userData', process.env.WORKMATE_DATA_DIR || path.join(app.getPath('
 if (!app.requestSingleInstanceLock()) { app.exit(0); return; }
 const bridgeLib = require('./bridge');
 
-const GOOGLE_SCOPES = [
-  'openid', 'email',
-  'https://www.googleapis.com/auth/gmail.modify', // read + change labels (mark as read); cannot send or delete
-  'https://www.googleapis.com/auth/calendar.readonly',
-].join(' ');
 const ASANA_API = 'https://app.asana.com/api/1.0';
 // Smallest sizes that still show every title-bar button plus the Windows caption buttons (~140px)
 const WIDGET_SIZE = { width: 440, height: 720 };
@@ -28,16 +23,23 @@ const fit = (b, [w, h]) => ({ ...b, width: Math.max(b.width || w, w), height: Ma
 
 // ---------- config (secrets encrypted with Windows DPAPI via safeStorage) ----------
 const cfgPath = () => path.join(app.getPath('userData'), 'config.json');
-let cfg = { google: {}, asana: {}, ai: {}, ui: {}, links: {}, urgency: { threads: {}, senders: {} }, muted: ['asana.com', 'everhour.com'] };
+let cfg = { google: {}, microsoft: {}, jira: {}, salesforce: {}, asana: {}, ai: {}, ui: {}, links: {}, urgency: { threads: {}, senders: {} }, muted: ['asana.com', 'everhour.com'] };
 const loadCfg = () => { try { cfg = { ...cfg, ...JSON.parse(fs.readFileSync(cfgPath(), 'utf8')) }; } catch {} };
 const saveCfg = () => fs.writeFileSync(cfgPath(), JSON.stringify(cfg, null, 2));
 const enc = (s) => safeStorage.encryptString(s).toString('base64');
 const dec = (s) => (s ? safeStorage.decryptString(Buffer.from(s, 'base64')) : '');
 
 const publicCfg = () => ({
-  google: {
-    clientId: cfg.google.clientId || '', hasSecret: !!cfg.google.secret, connected: !!cfg.google.refresh, email: cfg.google.email || '',
-    canModify: (cfg.google.scope || '').includes('gmail.modify'),
+  accounts: (cfg.accounts || []).map((a) => ({
+    id: a.id, provider: a.provider, email: a.email, needsReconnect: !!a.needsReconnect,
+    canModify: a.provider !== 'google' || (a.scope || '').includes('gmail.modify'),
+  })),
+  google: { clientId: cfg.google.clientId || '', hasSecret: !!cfg.google.secret },
+  microsoft: { clientId: cfg.microsoft?.clientId || '', tenant: cfg.microsoft?.tenant || '' },
+  jira: { connected: !!cfg.jira?.token, site: cfg.jira?.site || '', email: cfg.jira?.email || '', user: cfg.jira?.user || null },
+  salesforce: {
+    connected: !!cfg.salesforce?.refresh, clientId: cfg.salesforce?.clientId || '', loginUrl: cfg.salesforce?.loginUrl || '',
+    instanceUrl: cfg.salesforce?.instanceUrl || '', user: cfg.salesforce?.user || null, port: services.SF_PORT,
   },
   asana: { connected: !!cfg.asana.pat, user: cfg.asana.user || null, workspaces: cfg.asana.workspaces || [], workspaceGid: cfg.asana.workspaceGid || '' },
   everhour: { connected: !!cfg.everhour?.key, user: cfg.everhour?.user || null },
@@ -46,78 +48,7 @@ const publicCfg = () => ({
   ui: { theme: theme(), closeAction: cfg.ui.closeAction || 'ask', pinned: !!cfg.ui.pinned, widget: !!cfg.ui.widget, openAtLogin: !!cfg.ui.openAtLogin },
 });
 
-// ---------- Google OAuth (installed-app loopback + PKCE) ----------
-const b64url = (buf) => buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-
-function googleSignIn(clientId, clientSecret) {
-  return new Promise((resolve, reject) => {
-    const verifier = b64url(crypto.randomBytes(48));
-    const challenge = b64url(crypto.createHash('sha256').update(verifier).digest());
-    const state = b64url(crypto.randomBytes(16));
-    const server = http.createServer(async (req, res) => {
-      const url = new URL(req.url, 'http://127.0.0.1');
-      if (url.pathname !== '/') { res.writeHead(404).end(); return; }
-      const ok = url.searchParams.get('state') === state && url.searchParams.get('code');
-      res.writeHead(200, { 'Content-Type': 'text/html' }).end(
-        `<body style="font:16px system-ui;display:grid;place-items:center;height:90vh">${ok ? 'Signed in. You can close this tab and return to Workmate Desk.' : 'Sign-in failed. Return to Workmate Desk and try again.'}</body>`);
-      server.close();
-      clearTimeout(timer);
-      if (!ok) return reject(new Error(url.searchParams.get('error') || 'Google sign-in was cancelled'));
-      try {
-        const r = await fetch('https://oauth2.googleapis.com/token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({
-            client_id: clientId, client_secret: clientSecret, code: url.searchParams.get('code'),
-            code_verifier: verifier, grant_type: 'authorization_code', redirect_uri: redirectUri,
-          }),
-        });
-        const tok = await r.json();
-        if (!r.ok) throw new Error(tok.error_description || tok.error || 'Token exchange failed');
-        resolve(tok);
-      } catch (e) { reject(e); }
-    });
-    let redirectUri;
-    const timer = setTimeout(() => { server.close(); reject(new Error('Google sign-in timed out')); }, 5 * 60 * 1000);
-    server.listen(0, '127.0.0.1', () => {
-      redirectUri = `http://127.0.0.1:${server.address().port}`;
-      const auth = new URL('https://accounts.google.com/o/oauth2/v2/auth');
-      Object.entries({
-        client_id: clientId, redirect_uri: redirectUri, response_type: 'code', scope: GOOGLE_SCOPES,
-        code_challenge: challenge, code_challenge_method: 'S256', access_type: 'offline', prompt: 'consent', state,
-      }).forEach(([k, v]) => auth.searchParams.set(k, v));
-      shell.openExternal(auth.toString());
-    });
-  });
-}
-
-let access = { token: '', exp: 0 };
-async function googleToken(force) {
-  if (!force && access.token && Date.now() < access.exp - 60_000) return access.token;
-  if (!cfg.google.refresh) throw new Error('Google is not connected');
-  const r = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: cfg.google.clientId, client_secret: dec(cfg.google.secret),
-      refresh_token: dec(cfg.google.refresh), grant_type: 'refresh_token',
-    }),
-  });
-  const tok = await r.json();
-  if (!r.ok) throw new Error(`Google session expired, reconnect in Settings (${tok.error})`);
-  access = { token: tok.access_token, exp: Date.now() + tok.expires_in * 1000 };
-  return access.token;
-}
-
-async function googleFetch(url, init = {}, retried) {
-  const u = new URL(url);
-  if (u.protocol !== 'https:' || !u.hostname.endsWith('.googleapis.com')) throw new Error('Blocked non-Google URL');
-  const r = await fetch(u, { ...init, headers: { ...init.headers, Authorization: `Bearer ${await googleToken(retried)}` } });
-  if (r.status === 401 && !retried) return googleFetch(url, init, true);
-  const body = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(body.error?.message || `Google API ${r.status}`);
-  return body;
-}
+const svc = services.create({ getCfg: () => cfg, saveCfg: () => saveCfg(), enc, dec, open: (u) => shell.openExternal(u) });
 
 async function asanaFetch(p, init = {}, pat = dec(cfg.asana.pat)) {
   if (!p.startsWith('/')) throw new Error('Bad Asana path');
@@ -239,7 +170,7 @@ async function uploadAttachment(taskGid, { name, type, base64 }) {
 
 // ---------- Claude Code bridge ----------
 const bridge = bridgeLib.create({
-  google: (u, i) => googleFetch(u, i), asana: (p, i) => asanaFetch(p, i), everhour: (p, i) => everhourFetch(p, i),
+  mail: (id, u, i) => svc.mailFetch(id, u, i), asana: (p, i) => asanaFetch(p, i), everhour: (p, i) => everhourFetch(p, i),
   getCfg: () => cfg, saveCfg: () => saveCfg(),
   notify: (ch, data) => {
     if (!win) return;
@@ -372,26 +303,18 @@ const handle = (ch, fn) => ipcMain.handle(ch, (_e, ...a) => fn(...a));
 
 handle('config:get', () => publicCfg());
 
-handle('google:connect', async (clientId, clientSecret) => {
-  clientId = (clientId || cfg.google.clientId || '').trim();
-  clientSecret = (clientSecret || dec(cfg.google.secret) || '').trim();
-  if (!clientId.endsWith('.apps.googleusercontent.com')) throw new Error('Client ID should end with .apps.googleusercontent.com');
-  if (!clientSecret) throw new Error('Client secret is required');
-  const tok = await googleSignIn(clientId, clientSecret);
-  if (!tok.refresh_token) throw new Error('Google did not return a refresh token, try again');
-  cfg.google = { clientId, secret: enc(clientSecret), refresh: enc(tok.refresh_token), scope: tok.scope };
-  access = { token: tok.access_token, exp: Date.now() + tok.expires_in * 1000 };
-  cfg.google.email = (await googleFetch('https://openidconnect.googleapis.com/v1/userinfo')).email;
-  saveCfg();
-  return publicCfg();
-});
-
-handle('google:disconnect', () => {
-  cfg.google = { clientId: cfg.google.clientId, secret: cfg.google.secret };
-  access = { token: '', exp: 0 };
-  saveCfg();
-  return publicCfg();
-});
+const pub = (fn) => async (...a) => { await fn(...a); return publicCfg(); };
+handle('google:connect', pub((id, secret) => svc.connectGoogle(id, secret)));
+handle('ms:connect', pub((id, tenant) => svc.connectMicrosoft(id, tenant)));
+handle('account:reconnect', pub((id) => svc.reconnect(id)));
+handle('account:remove', pub((id) => svc.removeAccount(id)));
+handle('mail:fetch', (id, url, init) => svc.mailFetch(id, url, init));
+handle('jira:connect', pub((site, email, token) => svc.connectJira(site, email, token)));
+handle('jira:disconnect', pub(() => { cfg.jira = { site: cfg.jira?.site, email: cfg.jira?.email }; saveCfg(); }));
+handle('jira:fetch', (p, init) => svc.jiraFetch(p, init));
+handle('sf:connect', pub((id, loginUrl) => svc.connectSalesforce(id, loginUrl)));
+handle('sf:disconnect', pub(() => svc.disconnectSalesforce()));
+handle('sf:fetch', (p, init) => svc.sfFetch(p, init));
 
 handle('asana:connect', async (pat) => {
   pat = (pat || '').trim();
@@ -479,7 +402,6 @@ handle('everhour:fetch', async (p, init) => {
   return r;
 });
 
-handle('google:fetch', googleFetch);
 handle('asana:fetch', (p, init) => asanaFetch(p, init));
 
 handle('links:get', () => cfg.links);
@@ -576,6 +498,7 @@ function ensureStartMenuShortcut() {
 
 app.whenReady().then(() => {
   loadCfg();
+  if (services.migrate(cfg, aiStore())) { saveCfg(); saveAiStore(); }
   if (app.isPackaged) ensureStartMenuShortcut();
   nativeTheme.themeSource = theme().mode;
   try { cleanAttachmentCache(); } catch {}
