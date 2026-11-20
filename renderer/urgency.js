@@ -19,6 +19,7 @@
     const subj = (email.subject || '').toLowerCase();
     const et = tokens(email.subject + ' ' + (email.snippet || ''));
     return tasks.filter((t) => {
+      if (t.key && new RegExp(`\\b${t.key}\\b`, 'i').test(`${email.subject} ${email.snippet || ''}`)) return true; // Jira key, e.g. OPS-12
       const name = (t.name || '').toLowerCase();
       if (name.includes(' ') && name.length >= 8 && subj.includes(name)) return true;
       let shared = 0;

@@ -1,11 +1,13 @@
-/* global api, Urgency */
+/* global api, Urgency, Sources */
 const GMAIL = 'https://gmail.googleapis.com/gmail/v1/users/me';
+const GRAPH = 'https://graph.microsoft.com/v1.0/me';
 const GCAL = 'https://www.googleapis.com/calendar/v3/calendars/primary/events';
 const DAY = 86400000;
 
 const S = {
   cfg: null, ui: {}, view: 'mail', fromSettings: false,
-  emails: [], tasks: [], events: [], links: {}, urg: { threads: {}, senders: {} }, muted: [], mailNext: null, mailDays: 14, mailMax: 100,
+  emails: [], tasks: [], events: [], links: {}, urg: { threads: {}, senders: {} }, muted: [], mailNext: {}, acctFilter: '', mailDays: 14, mailMax: 100,
+  jira: [], cases: { list: [], q: '', scope: 'mine', sel: null, detail: null, form: null, meta: null, draft: '', ownerQ: '', owners: [] },
   timer: null, ehTime: {}, sections: {}, att: {}, files: [], editing: null, editDraft: '', linkQ: '', taskQ: '', boardQ: '', boardMenu: false, boardOpened: false, defaultBoard: null, utl: null, mySections: [], boards: [], boardSrc: 'my', board: null, taskSel: null, taskDetail: null, draft: '', lastLoad: 0,
   sel: null, bodies: {}, ai: {}, aiPending: new Set(), aiErr: {},
   filter: 'all', q: '', showNoise: false, loading: false,
@@ -30,7 +32,13 @@ const fmtShort = (d) => {
   if (now - d < 6 * DAY) return d.toLocaleDateString([], { weekday: 'short' });
   return d.toLocaleDateString([], { day: 'numeric', month: 'short' });
 };
-const taskById = (gid) => S.tasks.find((t) => t.gid === gid);
+const allTasks = () => [...S.tasks, ...S.jira]; // Asana tasks and Jira issues, same shape
+const taskById = (gid) => allTasks().find((t) => t.gid === gid);
+const isJira = (gid) => String(gid || '').startsWith('jira:');
+const tasksOn = () => S.cfg.asana.connected || S.cfg.jira.connected;
+const acctOf = (id) => S.cfg.accounts.find((a) => a.id === id);
+const primaryGoogle = () => S.cfg.accounts.find((a) => a.provider === 'google'); // the calendar comes from here
+const providerName = (p) => (p === 'microsoft' ? 'Outlook' : 'Gmail');
 const dueLabel = (t) => {
   const d = Urgency.daysUntil(t, new Date());
   if (d === null) return 'No due date';
@@ -40,7 +48,6 @@ const dueLabel = (t) => {
   return `Due ${Urgency.dueDate(t).toLocaleDateString([], { day: 'numeric', month: 'short' })}`;
 };
 const dueClass = (t) => { const d = Urgency.daysUntil(t, new Date()); return d === null ? '' : d < 0 ? 'overdue' : d <= 1 ? 'soon' : ''; };
-const gmailUrl = (threadId) => `https://mail.google.com/mail/u/?authuser=${encodeURIComponent(S.cfg.google.email)}#all/${threadId}`;
 const store = { get: (k) => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } }, set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} } };
 
 async function pool(items, n, fn) {
@@ -81,52 +88,75 @@ const I = {
 // ---------- data ----------
 function header(msg, name) { return msg.payload?.headers?.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value || ''; }
 
-function parseMeta(m) {
-  const from = header(m, 'From');
-  const addr = ((from.match(/<([^>]+)>/) || [, from])[1] || '').trim().toLowerCase();
-  return {
-    id: m.id, threadId: m.threadId, from, fromAddr: addr,
-    fromName: from.replace(/<[^>]+>/, '').replace(/"/g, '').trim() || addr,
-    subject: header(m, 'Subject') || '(no subject)', date: new Date(+m.internalDate),
-    snippet: decodeEntities(m.snippet), labelIds: m.labelIds || [],
-  };
-}
-
-// Fetch up to `want` threads not in `known`, newest first. `token` '' = first page.
-// Returns next: the page to resume from ('' or a token), or null when the inbox is exhausted.
+// Each account fetches up to `want` threads not in `known` (mail keys), newest first. `cursor` '' = first page.
+// next: where to resume ('' or a page token / Graph nextLink), or null when that inbox is exhausted.
 // If we stop part-way through a page, we resume from that same page; `known` skips what we already have.
-async function fetchMail(want, token, known) {
+async function fetchGmail(a, want, cursor, known) {
   const q = encodeURIComponent('in:inbox' + (S.mailDays ? ` newer_than:${S.mailDays}d` : ''));
   const picked = [];
-  let cur = token, next = null;
+  let cur = cursor, next = null;
   for (;;) {
-    const list = await api.google(`${GMAIL}/messages?maxResults=${Math.min(500, Math.max(50, want * 2))}&q=${q}${cur ? `&pageToken=${cur}` : ''}`);
+    const list = await api.mail(a.id, `${GMAIL}/messages?maxResults=${Math.min(500, Math.max(50, want * 2))}&q=${q}${cur ? `&pageToken=${cur}` : ''}`);
     let cut = false;
     for (const m of list.messages || []) {
-      if (known.has(m.threadId)) continue;
+      const k = Sources.mailKey(a.id, m.threadId);
+      if (known.has(k)) continue;
       if (picked.length >= want) { cut = true; break; }
-      known.add(m.threadId); picked.push(m);
+      known.add(k); picked.push(m);
     }
     next = cut ? cur : list.nextPageToken || null;
     if (cut || !list.nextPageToken) break;
     cur = list.nextPageToken;
   }
   // ponytail: one metadata call per thread; Gmail's batch endpoint would cut requests if 500+ feels slow
-  const meta = await pool(picked, 8, (m) => api.google(`${GMAIL}/messages/${m.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`));
-  const emails = meta.map(parseMeta);
+  const meta = await pool(picked, 8, (m) => api.mail(a.id, `${GMAIL}/messages/${m.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`));
+  return { emails: meta.map((m) => Sources.gmailEmail(a, m, decodeEntities)), next };
+}
+
+const OUTLOOK_FIELDS = 'id,conversationId,from,subject,receivedDateTime,bodyPreview,isRead,importance,flag,inferenceClassification,webLink';
+async function fetchOutlook(a, want, cursor, known) {
+  const since = S.mailDays ? `&$filter=receivedDateTime ge ${new Date(Date.now() - S.mailDays * DAY).toISOString()}` : '';
+  const first = `${GRAPH}/mailFolders/inbox/messages?$top=${Math.min(250, Math.max(50, want * 2))}&$orderby=receivedDateTime desc&$select=${OUTLOOK_FIELDS}${since}`;
+  const picked = [];
+  let cur = cursor, next = null;
+  for (;;) {
+    const page = await api.mail(a.id, cur || first);
+    let cut = false;
+    for (const m of page.value || []) { // newest first, so the first message seen is the conversation's newest
+      const k = Sources.mailKey(a.id, m.conversationId);
+      if (known.has(k)) continue;
+      if (picked.length >= want) { cut = true; break; }
+      known.add(k); picked.push(m);
+    }
+    next = cut ? cur : page['@odata.nextLink'] || null;
+    if (cut || !page['@odata.nextLink']) break;
+    cur = page['@odata.nextLink'];
+  }
+  return { emails: picked.map((m) => Sources.outlookEmail(a, m)), next };
+}
+
+// every account in parallel, merged newest first; one failing account doesn't empty the inbox
+// ponytail: "Load more" takes `want` from every account that has more, not `want` in total
+async function fetchMail(want, cursors, known) {
+  const rs = await Promise.all(S.cfg.accounts.filter((a) => cursors[a.id] !== null).map((a) =>
+    (a.provider === 'microsoft' ? fetchOutlook : fetchGmail)(a, want, cursors[a.id] || '', known)
+      .then((r) => ({ id: a.id, ...r }))
+      .catch((e) => { toast(`${a.email}: ${clean(e)}`); return { id: a.id, emails: [], next: cursors[a.id] || '' }; })));
+  const emails = rs.flatMap((r) => r.emails).sort((x, y) => y.date - x.date);
   const saved = await api.aiCached(emails.map(aiKey)).catch(() => ({}));
   for (const e of emails) {
     const c = saved[aiKey(e)] || store.get('ai:' + e.id);
     if (!c) continue;
-    S.ai[e.id] = c;
+    S.ai[aiKey(e)] = c;
     if (!saved[aiKey(e)]) api.aiSave(aiKey(e), c); // move reads saved by older versions into the file
   }
-  return { emails, next };
+  return { emails, next: Object.fromEntries(rs.map((r) => [r.id, r.next])) };
 }
 
 async function loadEmails() {
   // keep however many you've loaded with "Load more" when the app refreshes
-  const r = await fetchMail(Math.min(1000, Math.max(S.mailMax, S.emails.length)), '', new Set());
+  const most = Math.max(S.mailMax, ...S.cfg.accounts.map((a) => S.emails.filter((m) => m.acct === a.id).length));
+  const r = await fetchMail(Math.min(1000, most), {}, new Set());
   S.emails = r.emails; S.mailNext = r.next;
 }
 
@@ -174,7 +204,7 @@ const boardsOf = (t) => (t.projects?.length ? t.projects : t.parent?.projects ||
 
 async function loadBoard(src) {
   S.boardSrc = src;
-  if (src === 'my') { renderTasks(); return; }
+  if (src === 'my' || src === 'jira') { renderTasks(); return; }
   S.board = { src, loading: true, columns: [] };
   renderTasks();
   try {
@@ -223,8 +253,10 @@ function calRange() {
 }
 
 async function loadEvents() {
+  const g = primaryGoogle();
+  if (!g) { S.events = []; return; }
   const [from, to] = calRange();
-  const r = await api.google(`${GCAL}?singleEvents=true&orderBy=startTime&maxResults=250&timeMin=${from.toISOString()}&timeMax=${to.toISOString()}`);
+  const r = await api.mail(g.id, `${GCAL}?singleEvents=true&orderBy=startTime&maxResults=250&timeMin=${from.toISOString()}&timeMax=${to.toISOString()}`);
   S.events = (r.items || []).filter((e) => e.status !== 'cancelled');
 }
 
@@ -234,11 +266,10 @@ const partHeader = (p, name) => p.headers?.find((h) => h.name.toLowerCase() === 
 
 // The whole conversation, oldest first, with every picture as a data: URL:
 // inline ones (cid:, e.g. signatures and pasted screenshots) and picture attachments.
-async function loadBody(email) {
-  if (S.bodies[email.id]) return S.bodies[email.id];
-  const th = await api.google(`${GMAIL}/threads/${email.threadId}?format=full`);
+async function gmailThread(email) {
+  const th = await api.mail(email.acct, `${GMAIL}/threads/${email.threadId}?format=full`);
   let budget = 30; // ponytail: at most 30 pictures (5 MB each) per thread
-  const messages = await Promise.all(th.messages.map(async (m) => {
+  return Promise.all(th.messages.map(async (m) => {
     const msg = { id: m.id, from: header(m, 'From'), date: new Date(+m.internalDate), snippet: decodeEntities(m.snippet), html: '', text: '', images: [] };
     const walk = (p) => {
       if (!p) return;
@@ -253,14 +284,41 @@ async function loadBody(email) {
     await Promise.all(msg.images.map(async (im) => {
       if (budget-- <= 0 || (im.part.body?.size || 0) > 5 * 1024 * 1024) return;
       let data = im.part.body?.data;
-      if (!data && im.part.body?.attachmentId) data = (await api.google(`${GMAIL}/messages/${m.id}/attachments/${im.part.body.attachmentId}`).catch(() => ({}))).data;
+      if (!data && im.part.body?.attachmentId) data = (await api.mail(email.acct, `${GMAIL}/messages/${m.id}/attachments/${im.part.body.attachmentId}`).catch(() => ({}))).data;
       if (data) im.url = `data:${im.part.mimeType};base64,${b64(data)}`;
     }));
     return msg;
   }));
+}
+
+const odataStr = (s) => `'${String(s).replace(/'/g, "''")}'`;
+async function outlookThread(email) {
+  // no $orderby: Graph rejects it together with a conversationId filter
+  const r = await api.mail(email.acct, `${GRAPH}/messages?$filter=conversationId eq ${odataStr(email.threadId)}&$select=id,from,receivedDateTime,bodyPreview,body,hasAttachments&$top=50`);
+  const list = (r.value || []).sort((x, y) => new Date(x.receivedDateTime) - new Date(y.receivedDateTime));
+  let budget = 30;
+  return Promise.all(list.map(async (m) => {
+    const body = m.body || {};
+    const msg = { id: m.id, from: Sources.addrLine(m.from), date: new Date(m.receivedDateTime), snippet: m.bodyPreview || '', html: body.contentType === 'html' ? body.content : '', text: body.contentType === 'text' ? body.content : '', images: [] };
+    if (!m.hasAttachments && !msg.html.includes('cid:')) return msg;
+    const base = `${GRAPH}/messages/${encodeURIComponent(m.id)}/attachments`;
+    const att = await api.mail(email.acct, `${base}?$select=id,name,contentType,size,isInline`).catch(() => ({ value: [] }));
+    await Promise.all(att.value.filter((x) => x.contentType?.startsWith('image/') && x.size <= 5 * 1024 * 1024 && budget-- > 0).map(async (x) => {
+      const f = await api.mail(email.acct, `${base}/${encodeURIComponent(x.id)}`).catch(() => null);
+      if (f?.contentBytes) msg.images.push({ cid: (f.contentId || '').replace(/[<>]/g, ''), name: x.name || 'image', url: `data:${x.contentType};base64,${f.contentBytes}` });
+    }));
+    return msg;
+  }));
+}
+
+async function loadBody(email) {
+  const k = aiKey(email); // newest message: a new reply loads the thread again
+  if (S.bodies[k]) return S.bodies[k];
+  const messages = await (email.provider === 'microsoft' ? outlookThread : gmailThread)(email);
+  if (!messages.length) throw new Error('This conversation is empty or was moved');
   const last = messages[messages.length - 1];
   const body = { messages, text: last.text || htmlToText(last.html) }; // the AI reads the newest message
-  S.bodies[email.id] = body;
+  S.bodies[k] = body;
   const ids = Object.keys(S.bodies);
   if (ids.length > 15) delete S.bodies[ids[0]]; // keep memory flat
   return body;
@@ -341,7 +399,7 @@ function threadDoc(body) {
 async function loadAll() {
   if (S.loading) return;
   S.loading = true; S.lastLoad = Date.now(); renderTitlebar();
-  const jobs = [loadEmails(), loadEvents(), loadTasks(), loadTimer()];
+  const jobs = [loadEmails(), loadEvents(), loadTasks(), loadJira(), loadTimer(), S.cfg.salesforce.connected && S.cases.loaded ? loadCases() : null];
   (await Promise.allSettled(jobs)).forEach((r) => r.status === 'rejected' && toast(clean(r.reason)));
   S.loading = false;
   rescore(); render();
@@ -352,12 +410,12 @@ async function loadAll() {
 }
 
 // ---------- urgency + linking ----------
-const linkedTasks = (m) => (S.links[m.threadId] || []).map(taskById).filter(Boolean);
+const linkedTasks = (m) => (S.links[m.key] || []).map(taskById).filter(Boolean);
 
 function relatedTasks(m) {
   const out = new Map();
   linkedTasks(m).forEach((t) => out.set(t.gid, t));
-  (S.ai[m.id]?.suggestions || []).filter((s) => s.confidence === 'high').forEach((s) => { const t = taskById(s.task_gid); if (t) out.set(t.gid, t); });
+  (S.ai[aiKey(m)]?.suggestions || []).filter((s) => s.confidence === 'high').forEach((s) => { const t = taskById(s.task_gid); if (t) out.set(t.gid, t); });
   if (Urgency.isAsanaNotification(m.from)) Urgency.matchTasks(m, S.tasks).forEach((t) => out.set(t.gid, t));
   return [...out.values()];
 }
@@ -373,8 +431,8 @@ function rescore() {
     if (st > now && st - now < DAY) (e.attendees || []).forEach((a) => !a.self && soon.add(a.email.toLowerCase()));
   }
   for (const m of S.emails) {
-    const auto = Urgency.scoreEmail(m, { linkedTasks: relatedTasks(m), meetingSoonWith: soon, ai: S.ai[m.id], now });
-    m.u = Urgency.applyOverride(auto, S.urg.threads[m.threadId], S.urg.senders[m.fromAddr]);
+    const auto = Urgency.scoreEmail(m, { linkedTasks: relatedTasks(m), meetingSoonWith: soon, ai: S.ai[aiKey(m)], now });
+    m.u = Urgency.applyOverride(auto, S.urg.threads[m.key], S.urg.senders[m.fromAddr]);
   }
 }
 
@@ -384,36 +442,36 @@ function signalGids() {
   return s;
 }
 
-async function setLinks(threadId, gids) {
-  S.links = await api.setLinks(threadId, gids);
+async function setLinks(key, gids) {
+  S.links = await api.setLinks(key, gids);
   rescore(); refreshPanes();
 }
 
-const aiKey = (m) => `${m.threadId}:${m.id}`; // thread + newest message: a new reply means a fresh read
+const aiKey = (m) => `${m.key}:${m.id}`; // account + thread + newest message: a new reply means a fresh read
 
 async function analyze(email, force) {
-  if (!S.cfg.ai.connected || S.aiPending.has(email.id) || (!force && S.ai[email.id])) return;
-  S.aiPending.add(email.id); delete S.aiErr[email.id];
+  const k = aiKey(email);
+  if (!S.cfg.ai.connected || S.aiPending.has(k) || (!force && S.ai[k])) return;
+  S.aiPending.add(k); delete S.aiErr[k];
   refreshPanes();
   try {
     const body = await loadBody(email);
     // ponytail: AI sees the 150 most time-relevant tasks, not all of them, to keep each call small
     const far = 8.64e15;
-    const aiTasks = [...S.tasks].sort((a, b) => (Urgency.dueDate(a) || far) - (Urgency.dueDate(b) || far)).slice(0, 150);
-    const res = await api.analyze({
+    const aiTasks = allTasks().sort((a, b) => (Urgency.dueDate(a) || far) - (Urgency.dueDate(b) || far)).slice(0, 150);
+    S.ai[k] = await api.analyze({
       email: { from: email.from, date: email.date.toString(), subject: email.subject, body: body.text },
-      tasks: aiTasks, today: new Date().toDateString(), cacheKey: aiKey(email), force: !!force,
+      tasks: aiTasks, today: new Date().toDateString(), cacheKey: k, force: !!force,
     });
-    S.ai[email.id] = res;
-  } catch (e) { S.aiErr[email.id] = clean(e); }
-  S.aiPending.delete(email.id);
+  } catch (e) { S.aiErr[k] = clean(e); }
+  S.aiPending.delete(k);
   rescore(); refreshPanes();
 }
 
 // AI pre-reads the newest unread emails so urgency is known before you open them.
 function backgroundAnalyze() {
   if (!S.cfg.ai.connected) return;
-  const todo = heads(S.emails).filter((m) => m.labelIds.includes('UNREAD') && !S.ai[m.id] && !isNoise(m)
+  const todo = heads(S.emails).filter((m) => m.labelIds.includes('UNREAD') && !S.ai[aiKey(m)] && !isNoise(m)
     && !m.labelIds.some((l) => /CATEGORY_(PROMOTIONS|SOCIAL|FORUMS)/.test(l))).slice(0, 8);
   pool(todo, S.cfg.ai.mode === 'claude-code' ? 1 : 2, (m) => analyze(m)); // one Claude Code process at a time keeps the PC light
 }
@@ -429,6 +487,7 @@ function renderTitlebar() {
       <button class="${S.view === 'mail' ? 'on' : ''}" data-action="tab" data-tab="mail">Mail</button>
       <button class="${S.view === 'calendar' ? 'on' : ''}" data-action="tab" data-tab="calendar">Calendar</button>
       <button class="${S.view === 'tasks' ? 'on' : ''}" data-action="tab" data-tab="tasks">Tasks</button>
+      ${S.cfg.salesforce.connected ? `<button class="${S.view === 'cases' ? 'on' : ''}" data-action="tab" data-tab="cases">Cases</button>` : ''}
     </div>`}
     <div class="tb-actions">
       ${S.timer && !setup ? `<button class="timer-pill" ${timerGid() ? `data-action="goto-task" data-gid="${esc(timerGid())}"` : ''} title="Tracking in Everhour: ${esc(S.timer.task?.name)}">
@@ -454,20 +513,17 @@ function appearanceCard() {
   </div>`;
 }
 
-function renderSetup() {
-  const g = S.cfg.google, a = S.cfg.asana, ai = S.cfg.ai;
-  return `<section class="setup">
-    <div class="hero">
-      <div class="app-icon">${I.spark}</div>
-      <h1>${S.fromSettings ? 'Settings' : 'Welcome to Workmate Desk'}</h1>
-      <p>${S.fromSettings ? 'Your connections. Keys stay on this PC, encrypted by Windows.' : 'Setup takes about 10 minutes and you only do it once. Only Google is required; Asana, Everhour and the AI assistant are optional. Every key stays on this PC, encrypted by Windows.'}</p>
-    </div>
+function accountsCard() {
+  const g = S.cfg.google, ms = S.cfg.microsoft, list = S.cfg.accounts;
+  return `<div class="card glass">
+      <div class="card-head"><span class="badge g">✉</span><div><h2>Mail accounts</h2><p>Gmail and Outlook in one inbox, as many accounts as you like. Calendar comes from your first Gmail account.</p></div>
+        ${list.length ? `<span class="status ok">${list.length} connected</span>` : '<span class="status">Required</span>'}</div>
+      ${list.map((a) => `<div class="row acct-row"><span><span class="src ${a.provider}">${providerName(a.provider)}</span> <b>${esc(a.email)}</b>
+          ${a.needsReconnect ? '<span class="chip red">Sign-in expired</span>' : !a.canModify ? '<span class="chip orange">Reconnect to mark mail read</span>' : ''}</span>
+        <span class="acct-btns"><button class="btn ghost tiny" data-action="acct-reconnect" data-id="${esc(a.id)}">Reconnect</button><button class="btn ghost tiny" data-action="acct-remove" data-id="${esc(a.id)}">Disconnect</button></span></div>`).join('')}
 
-    <div class="card glass">
-      <div class="card-head"><span class="badge g">G</span><div><h2>Google Workspace</h2><p>Gmail (read and mark as read) and Calendar (read-only)</p></div>
-        ${g.connected ? '<span class="status ok">Connected</span>' : '<span class="status">Required</span>'}</div>
-      ${g.connected ? `<div class="row"><span>Signed in as <b>${esc(g.email)}</b></span><button class="btn ghost" data-action="google-disconnect">Disconnect</button></div>` : `
-      <details class="help" ${S.fromSettings ? '' : 'open'}><summary>Step by step: get a Google client ID (about 5 minutes)</summary>
+      <div class="sub">Add a Gmail account</div>
+      <details class="help" ${S.fromSettings || g.hasSecret ? '' : 'open'}><summary>Step by step: get a Google client ID (about 5 minutes, once per company)</summary>
         <p class="hint">Already have one? If a colleague or your IT admin set Workmate Desk up before, ask them for the client ID and secret and jump to step 6. One pair works for the whole company.</p>
         <ol class="steps">
         <li>Sign in to <a href="#" data-action="open-link" data-url="https://console.cloud.google.com/projectcreate">Google Cloud Console</a> with your work Google account and create a project. Any name works, for example <i>Workmate Desk</i>.</li>
@@ -476,13 +532,77 @@ function renderSetup() {
         <li>Go to <a href="#" data-action="open-link" data-url="https://console.cloud.google.com/auth/clients/create">Clients → Create client</a>. Set <b>Application type</b> to <b>Desktop app</b>, name it <i>Workmate Desk</i> and click <b>Create</b>.</li>
         <li>A box shows the <b>Client ID</b> (ends in <code>.apps.googleusercontent.com</code>) and the <b>Client secret</b> (starts with <code>GOCSPX-</code>). Copy both.</li>
         <li>Paste them below and click <b>Sign in with Google</b>. Your browser opens: pick your account and click <b>Allow</b>. If Google warns the app isn't verified, that's your own app: click <b>Advanced</b>, then <b>Go to Workmate Desk</b>.</li>
-        <li>Come back here. The card says <b>Connected</b>.</li>
+        <li>Come back here. The account appears in the list above. Repeat step 6 for each extra Gmail account.</li>
         </ol>
         <p class="hint">Older Google Cloud screens call steps 3 and 4 <i>OAuth consent screen</i> and <i>Credentials → Create credentials → OAuth client ID</i>.</p></details>
       <label class="lbl">Client ID<input class="field" id="g-id" value="${esc(g.clientId)}" placeholder="1234-abc.apps.googleusercontent.com" spellcheck="false"></label>
       <label class="lbl">Client secret<input class="field" id="g-secret" type="password" placeholder="${g.hasSecret ? 'Saved (leave blank to keep)' : 'GOCSPX-…'}" spellcheck="false"></label>
-      <div class="row end"><button class="btn primary" data-action="google-connect">Sign in with Google</button></div>`}
+      <div class="row end"><button class="btn primary" data-action="google-connect">Sign in with Google</button></div>
+
+      <div class="sub">Add an Outlook / Microsoft 365 account</div>
+      <details class="help" ${ms.clientId ? '' : 'open'}><summary>Step by step: register Workmate Desk with Microsoft (about 5 minutes, once per company)</summary>
+        <p class="hint">Your IT admin may already have done this: ask for the application (client) ID and directory (tenant) ID and jump to step 5.</p>
+        <ol class="steps">
+        <li>Open <a href="#" data-action="open-link" data-url="https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade">Microsoft Entra admin center → App registrations</a> and click <b>New registration</b>. Name it <i>Workmate Desk</i>.</li>
+        <li>Under <b>Supported account types</b> pick <b>Accounts in this organizational directory only</b>. Under <b>Redirect URI</b> pick <b>Public client/native (mobile &amp; desktop)</b> and enter <code>http://localhost</code>. Click <b>Register</b>.</li>
+        <li>Open <b>API permissions</b> → <b>Add a permission</b> → <b>Microsoft Graph</b> → <b>Delegated permissions</b>, tick <b>Mail.ReadWrite</b>, <b>User.Read</b> and <b>offline_access</b>, and click <b>Add permissions</b>. If your organisation requires it, an admin clicks <b>Grant admin consent</b>.</li>
+        <li>On <b>Overview</b>, copy the <b>Application (client) ID</b> and the <b>Directory (tenant) ID</b>.</li>
+        <li>Paste them below and click <b>Sign in with Microsoft</b>. Pick your account in the browser and accept.</li>
+        </ol>
+        <p class="hint">Mail.ReadWrite is only used to mark mail read. Workmate Desk never sends, moves or deletes mail.</p></details>
+      <label class="lbl">Application (client) ID<input class="field" id="ms-id" value="${esc(ms.clientId)}" placeholder="00000000-0000-0000-0000-000000000000" spellcheck="false"></label>
+      <label class="lbl">Directory (tenant) ID<input class="field" id="ms-tenant" value="${esc(ms.tenant)}" placeholder="Tenant ID, or common for personal Outlook.com" spellcheck="false"></label>
+      <div class="row end"><button class="btn primary" data-action="ms-connect">Sign in with Microsoft</button></div>
+    </div>`;
+}
+
+function jiraCard() {
+  const j = S.cfg.jira;
+  return `<div class="card glass">
+      <div class="card-head"><span class="badge jira">J</span><div><h2>Jira</h2><p>Issues assigned to you, alongside your Asana tasks</p></div>
+        ${j.connected ? '<span class="status ok">Connected</span>' : '<span class="status">Optional</span>'}</div>
+      ${j.connected ? `<div class="row"><span>Signed in to <b>${esc(j.site.replace('https://', ''))}</b> as <b>${esc(j.user?.name)}</b></span><button class="btn ghost" data-action="jira-disconnect">Disconnect</button></div>` : `
+      <details class="help" ${S.fromSettings ? '' : 'open'}><summary>Step by step: connect Jira Cloud (1 minute)</summary><ol class="steps">
+        <li>Open <a href="#" data-action="open-link" data-url="https://id.atlassian.com/manage-profile/security/api-tokens">Atlassian API tokens</a> and click <b>Create API token</b>. Name it <i>Workmate Desk</i> and copy it.</li>
+        <li>Enter your Jira site (the address you open Jira at), your Atlassian email and the token below, then click <b>Connect Jira</b>.</li>
+        </ol><p class="hint">The token acts as you: comments and status changes you make here appear in Jira under your name.</p></details>
+      <label class="lbl">Jira site<input class="field" id="j-site" value="${esc(j.site)}" placeholder="your-company.atlassian.net" spellcheck="false"></label>
+      <label class="lbl">Atlassian email<input class="field" id="j-email" value="${esc(j.email)}" spellcheck="false"></label>
+      <label class="lbl">API token<input class="field" id="j-token" type="password" spellcheck="false"></label>
+      <div class="row end"><button class="btn primary" data-action="jira-connect">Connect Jira</button></div>`}
+    </div>`;
+}
+
+function salesforceCard() {
+  const sf = S.cfg.salesforce;
+  return `<div class="card glass">
+      <div class="card-head"><span class="badge sf">☁</span><div><h2>Salesforce</h2><p>Search, update and comment on Cases</p></div>
+        ${sf.connected ? '<span class="status ok">Connected</span>' : '<span class="status">Optional</span>'}</div>
+      ${sf.connected ? `<div class="row"><span>Signed in as <b>${esc(sf.user?.name)}</b> on ${esc(sf.instanceUrl.replace('https://', ''))}</span><button class="btn ghost" data-action="sf-disconnect">Disconnect</button></div>` : `
+      <details class="help" ${S.fromSettings || sf.clientId ? '' : 'open'}><summary>Step by step: set up Salesforce (admin, about 10 minutes, once per company)</summary>
+        <p class="hint">Your Salesforce admin does steps 1 to 3 once; then everyone only needs the consumer key.</p>
+        <ol class="steps">
+        <li>In Salesforce Setup, open <b>App Manager</b> and create a <b>New External Client App</b> (or <b>New Connected App</b> in older orgs) named <i>Workmate Desk</i>.</li>
+        <li>Turn on OAuth. Set the callback URL to <code>http://localhost:${sf.port}/callback</code> and add the scopes <b>Manage user data via APIs (api)</b> and <b>Perform requests at any time (refresh_token, offline_access)</b>.</li>
+        <li>Tick <b>Require Proof Key for Code Exchange (PKCE)</b>, untick <b>Require secret for Web Server Flow</b> and <b>Require secret for Refresh Token Flow</b>, and save. Copy the <b>Consumer Key</b>. A new app can take up to 10 minutes to start working.</li>
+        <li>Paste the consumer key below. Leave the login URL as is, or use <code>test.salesforce.com</code> for a sandbox or your My Domain address. Click <b>Sign in with Salesforce</b>.</li>
+        </ol></details>
+      <label class="lbl">Consumer key<input class="field" id="sf-id" value="${esc(sf.clientId)}" spellcheck="false"></label>
+      <label class="lbl">Login URL<input class="field" id="sf-login" value="${esc(sf.loginUrl || 'https://login.salesforce.com')}" spellcheck="false"></label>
+      <div class="row end"><button class="btn primary" data-action="sf-connect">Sign in with Salesforce</button></div>`}
+    </div>`;
+}
+
+function renderSetup() {
+  const a = S.cfg.asana, ai = S.cfg.ai;
+  return `<section class="setup">
+    <div class="hero">
+      <div class="app-icon">${I.spark}</div>
+      <h1>${S.fromSettings ? 'Settings' : 'Welcome to Workmate Desk'}</h1>
+      <p>${S.fromSettings ? 'Your connections. Keys stay on this PC, encrypted by Windows.' : 'Setup takes about 10 minutes and you only do it once. You need one Gmail or Outlook account; Asana, Jira, Salesforce, Everhour and the AI assistant are optional. Every key stays on this PC, encrypted by Windows.'}</p>
     </div>
+
+    ${accountsCard()}
 
     <div class="card glass">
       <div class="card-head"><span class="badge a">a</span><div><h2>Asana</h2><p>Your open tasks, due dates and links</p></div>
@@ -499,8 +619,11 @@ function renderSetup() {
       <div class="row end"><button class="btn primary" data-action="asana-connect">Connect Asana</button></div>`}
     </div>
 
+    ${jiraCard()}
+    ${salesforceCard()}
+
     <div class="card glass">
-      <div class="card-head"><span class="badge ai">${I.spark}</span><div><h2>AI assistant</h2><p>Reads each email and advises which Asana task it belongs to and how urgent it is</p></div>
+      <div class="card-head"><span class="badge ai">${I.spark}</span><div><h2>AI assistant</h2><p>Reads each email and advises which task or issue it belongs to and how urgent it is</p></div>
         ${ai.connected ? '<span class="status ok">Connected</span>' : '<span class="status">Optional</span>'}</div>
       ${ai.connected ? `<div class="row"><span>${{ 'claude-code': `Using your Claude Code on this PC${ai.version ? ' (' + esc(ai.version) + ')' : ''}`, platform: 'Signed in with your Claude Platform account' }[ai.mode] || 'Claude API key saved'}</span><button class="btn ghost" data-action="ai-disconnect">${ai.mode === 'key' ? 'Remove' : 'Stop using'}</button></div>
       ${ai.mode === 'claude-code' ? '<p class="hint">Uses the account Claude Code is signed in with, and counts toward its usage. Tools are switched off and your Claude Code settings, hooks and plugins are skipped, so an email can only be read, never acted on.</p>' : ''}` : `
@@ -564,10 +687,10 @@ function renderSetup() {
     <div class="card glass">
       <label class="lbl inline" style="margin-bottom:14px">When I close the window<select class="field" id="close-action">${[['ask', 'Ask me'], ['widget', 'Turn into widget'], ['quit', 'Quit Workmate Desk']].map(([v, l]) => `<option value="${v}" ${S.ui.closeAction === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
       <label class="toggle"><input type="checkbox" id="login" ${S.ui.openAtLogin ? 'checked' : ''}><span></span>Open at Windows sign-in</label>
-      <label class="toggle" style="margin-top:12px"><input type="checkbox" id="notify" ${store.get('notify') === false ? '' : 'checked'}><span></span>Notify me about new Asana tasks and urgent email</label>
+      <label class="toggle" style="margin-top:12px"><input type="checkbox" id="notify" ${store.get('notify') === false ? '' : 'checked'}><span></span>Notify me about new tasks, Jira issues and urgent email</label>
     </div>` : ''}
 
-    <div class="row center"><button class="btn primary big" data-action="setup-done" ${g.connected ? '' : 'disabled'}>${S.fromSettings ? 'Done' : 'Continue'}</button></div>
+    <div class="row center"><button class="btn primary big" data-action="setup-done" ${S.cfg.accounts.length ? '' : 'disabled'}>${S.fromSettings ? 'Done' : 'Continue'}</button></div>
   </section>`;
 }
 
@@ -578,6 +701,7 @@ function mailSkeleton() {
       <div class="pane-head">
         <div class="ph-row"><h2>Inbox</h2><span class="muted" id="mail-count"></span></div>
         <input class="field search" id="q" type="search" placeholder="Search" value="${esc(S.q)}">
+        ${S.cfg.accounts.length > 1 ? `<select class="field acct-pick" id="acct-filter"><option value="">All accounts</option>${S.cfg.accounts.map((a) => `<option value="${esc(a.id)}" ${S.acctFilter === a.id ? 'selected' : ''}>${providerName(a.provider)} · ${esc(a.email)}</option>`).join('')}</select>` : ''}
         <div class="seg small" id="mail-filter"></div>
       </div>
       <div class="scroll" id="mail-list"></div>
@@ -585,7 +709,7 @@ function mailSkeleton() {
     </div>
     <div class="pane glass detail-pane"><div class="scroll"><div id="detail-head"></div><div id="detail-body"></div></div></div>
     <aside class="pane glass focus-pane">
-      <div class="pane-head"><div class="ph-row"><h2>Focus</h2><span class="muted">Asana</span></div></div>
+      <div class="pane-head"><div class="ph-row"><h2>Focus</h2><span class="muted">Tasks</span></div></div>
       <div class="scroll" id="focus"></div>
       ${resizer('w-focus', 'left')}
     </aside>
@@ -612,10 +736,11 @@ function regroup() {
 }
 const heads = (list) => { const seen = new Set(); return list.filter((m) => { const k = dupKey(m); return !seen.has(k) && seen.add(k); }); }; // newest of each group
 
+const inScope = () => (S.acctFilter ? S.emails.filter((m) => m.acct === S.acctFilter) : S.emails);
 function visibleEmails() {
   regroup();
   const q = S.q.toLowerCase();
-  let list = heads(S.emails).filter((m) => !q || groupOf(m).some((x) => (x.subject + x.from + x.snippet).toLowerCase().includes(q)));
+  let list = heads(inScope()).filter((m) => !q || groupOf(m).some((x) => (x.subject + x.from + x.snippet).toLowerCase().includes(q)));
   const asana = list.filter(isNoise);
   if (S.filter === 'asana') return { list: asana, asana };
   list = list.filter((m) => !isNoise(m));
@@ -626,21 +751,22 @@ function visibleEmails() {
 }
 
 function mailItem(m) {
-  const linked = (S.links[m.threadId] || []).length;
-  const ai = S.ai[m.id];
+  const linked = (S.links[m.key] || []).length;
+  const ai = S.ai[aiKey(m)];
   const n = groupOf(m).length;
-  return `<button class="mail-item lv-${m.u.level} ${S.sel === m.threadId ? 'sel' : ''} ${groupUnread(m) ? 'unread' : ''}" data-action="open-mail" data-id="${esc(m.threadId)}" ${n > 1 ? `title="${n} copies of this email, shown once"` : ''}>
+  return `<button class="mail-item lv-${m.u.level} ${S.sel === m.key ? 'sel' : ''} ${groupUnread(m) ? 'unread' : ''}" data-action="open-mail" data-id="${esc(m.key)}" ${n > 1 ? `title="${n} copies of this email, shown once"` : ''}>
     <span class="avatar" style="--h:${hue(m.fromAddr)}">${esc(initials(m.fromName))}</span>
     <span class="mi">
       <span class="mi-top"><span class="mi-from">${esc(m.fromName)}</span><span class="mi-time">${fmtShort(m.date)}</span></span>
       <span class="mi-subj">${esc(m.subject)}</span>
       <span class="mi-snip">${esc(ai?.summary || m.snippet)}</span>
+      ${S.cfg.accounts.length > 1 ? `<span class="mi-src"><span class="src ${m.provider}">${providerName(m.provider)}</span>${esc(m.mailbox)}</span>` : ''}
       <span class="chips">
         ${n > 1 ? `<span class="chip gray">×${n}</span>` : ''}
         ${m.u.level === 'urgent' ? '<span class="chip red">Urgent</span>' : m.u.level === 'high' ? '<span class="chip orange">High</span>' : ''}
         ${linked ? `<span class="chip blue">${I.link}${linked}</span>` : ''}
         ${ai?.suggestions?.length && !linked ? `<span class="chip purple">${I.spark}Task match</span>` : ''}
-        ${S.aiPending.has(m.id) ? '<span class="chip gray shimmer">Reading…</span>' : ''}
+        ${S.aiPending.has(aiKey(m)) ? '<span class="chip gray shimmer">Reading…</span>' : ''}
       </span>
     </span>
   </button>`;
@@ -648,7 +774,7 @@ function mailItem(m) {
 
 function renderList() {
   const { list, asana } = visibleEmails();
-  const rows = heads(S.emails).filter((m) => !isNoise(m));
+  const rows = heads(inScope()).filter((m) => !isNoise(m));
   const urgentCount = rows.filter((m) => m.u?.level !== 'normal').length;
   const unreadCount = rows.filter(groupUnread).length;
   $('#mail-filter').innerHTML = [['all', 'All'], ['unread', `Unread${unreadCount ? ' ' + unreadCount : ''}`], ['urgent', `Urgent${urgentCount ? ' ' + urgentCount : ''}`], ['asana', `Muted${asana.length ? ' ' + asana.length : ''}`]]
@@ -658,10 +784,10 @@ function renderList() {
       <span class="badge a sm">a</span><span><b>${asana.length} notifications muted</b><br><span class="muted">${esc(mutedSources(asana))}</span></span>${I.fwd}</button>` : '';
   $('#mail-list').innerHTML = S.loading && !S.emails.length ? '<div class="empty">Loading mail…</div>'
     : digest + (list.map(mailItem).join('') || '<div class="empty">Nothing here</div>')
-      + (S.mailNext !== null ? '<button class="noise-toggle" data-action="load-more">Load 50 more</button>' : `<p class="muted center">That's everything${S.mailDays ? ` from the last ${S.mailDays} days` : ''}</p>`);
+      + (Object.values(S.mailNext).some((v) => v !== null) ? '<button class="noise-toggle" data-action="load-more">Load 50 more</button>' : `<p class="muted center">That's everything${S.mailDays ? ` from the last ${S.mailDays} days` : ''}</p>`);
 }
 
-const selectedEmail = () => S.emails.find((m) => m.threadId === S.sel);
+const selectedEmail = () => S.emails.find((m) => m.key === S.sel);
 
 function taskRow(t, extra = '') {
   return `<div class="task-row">
@@ -681,8 +807,8 @@ function matchesQuery(t, q) {
 function linkResults() {
   const m = selectedEmail();
   if (!m || !S.linkQ.trim()) return '';
-  const linked = new Set(S.links[m.threadId] || []);
-  const hits = S.tasks.filter((t) => !linked.has(t.gid) && matchesQuery(t, S.linkQ));
+  const linked = new Set(S.links[m.key] || []);
+  const hits = allTasks().filter((t) => !linked.has(t.gid) && matchesQuery(t, S.linkQ));
   return hits.slice(0, 8).map((t) => taskRow(t, `<button class="btn tiny" data-action="link" data-gid="${esc(t.gid)}">Link</button>`)).join('')
     + (hits.length > 8 ? `<p class="muted">${hits.length - 8} more, keep typing to narrow down</p>` : '')
     + (hits.length ? '' : '<p class="muted">No matching task</p>');
@@ -718,11 +844,11 @@ function renderDetailHeadNow() {
   const m = selectedEmail();
   const el = $('#detail-head');
   if (!el) return;
-  if (!m) { el.innerHTML = '<div class="empty big">Select an email<br><span class="muted">Urgent mail is marked red. Linked Asana tasks show up here.</span></div>'; return; }
+  if (!m) { el.innerHTML = '<div class="empty big">Select an email<br><span class="muted">Urgent mail is marked red. Linked tasks and Jira issues show up here.</span></div>'; return; }
   const linked = linkedTasks(m);
   const linkedSet = new Set(linked.map((t) => t.gid));
-  const ai = S.ai[m.id];
-  const unlinkedTasks = S.tasks.filter((t) => !linkedSet.has(t.gid));
+  const k = aiKey(m), ai = S.ai[k];
+  const unlinkedTasks = allTasks().filter((t) => !linkedSet.has(t.gid));
 
   // Foldable sections: Urgency, AI context, Linked tasks. Folded, each keeps a one-line summary.
   // What you fold is remembered (Urgency starts folded: it's set rarely).
@@ -733,13 +859,13 @@ function renderDetailHeadNow() {
 
   let aiCard;
   if (!S.cfg.ai.connected) {
-    const local = Urgency.matchTasks(m, S.tasks).filter((t) => !linkedSet.has(t.gid));
+    const local = Urgency.matchTasks(m, allTasks()).filter((t) => !linkedSet.has(t.gid));
     aiCard = fold('ai', '', `${I.spark}<b>Suggestions</b>`, local.length ? `${local.length} possible task${local.length > 1 ? 's' : ''}` : 'No obvious matching task',
       `<p class="muted">Keyword match. Add an AI assistant in Settings for better advice.</p>${local.map((t) => taskRow(t, `<button class="btn tiny" data-action="link" data-gid="${t.gid}">Link</button>`)).join('')}`, true);
-  } else if (S.aiPending.has(m.id)) {
+  } else if (S.aiPending.has(k)) {
     aiCard = fold('ai', 'ai', `${I.spark}<b>AI context</b>`, 'Reading…', '<div class="shimmer-lines"><i></i><i></i><i></i></div>', true);
-  } else if (S.aiErr[m.id]) {
-    aiCard = fold('ai', 'ai', `${I.spark}<b>AI context</b><button class="btn tiny" data-action="reanalyze">Retry</button>`, esc(S.aiErr[m.id]), `<p class="muted">${esc(S.aiErr[m.id])}</p>`, true);
+  } else if (S.aiErr[k]) {
+    aiCard = fold('ai', 'ai', `${I.spark}<b>AI context</b><button class="btn tiny" data-action="reanalyze">Retry</button>`, esc(S.aiErr[k]), `<p class="muted">${esc(S.aiErr[k])}</p>`, true);
   } else if (ai) {
     const sugg = ai.suggestions.filter((s) => !linkedSet.has(s.task_gid));
     aiCard = fold('ai', 'ai', `${I.spark}<b>AI context</b><span class="chip ${urgClass[ai.urgency]}">${esc(cap(ai.urgency))}</span><button class="btn tiny ghost" data-action="reanalyze" title="Analyse again">${I.refresh}</button>`,
@@ -756,28 +882,30 @@ function renderDetailHeadNow() {
   const urgCard = fold('urg', 'urg', `${I.flag}<b>Urgency</b><span class="chip ${urgClass[m.u.level] || 'gray'}">${esc(cap(m.u.level))}</span>`,
     esc(m.u.reasons.join(' · ') || 'Automatic'),
     `<div class="chips">${m.u.reasons.map((r) => `<span class="chip ${m.u.level === 'urgent' ? 'red' : m.u.level === 'high' ? 'orange' : 'gray'}">${esc(r)}</span>`).join('')}</div>
-      ${urgencyPicker('threads', m.threadId, 'This email', m.u.manual === 'thread' ? m.u.auto?.level : null)}
+      ${urgencyPicker('threads', m.key, 'This email', m.u.manual === 'thread' ? m.u.auto?.level : null)}
       ${urgencyPicker('senders', m.fromAddr, `All mail from ${m.fromName}`)}`, false);
 
   const linkCard = fold('link', 'links', `${I.link}<b>Linked tasks</b><span class="count-pill">${linked.length}</span>`,
     esc(linked.map((t) => t.name).join(' · ') || 'None yet'),
     `${linked.map((t) => taskRow(t, `<button class="btn tiny ghost" data-action="unlink" data-gid="${t.gid}">Unlink</button>`)).join('') || '<p class="muted">None yet. Saved on this PC.</p>'}
-      ${unlinkedTasks.length ? `<input class="field search" id="link-q" type="search" placeholder="Search your ${unlinkedTasks.length} tasks to link…" value="${esc(S.linkQ)}" style="margin-top:10px">
+      ${unlinkedTasks.length ? `<input class="field search" id="link-q" type="search" placeholder="Search your ${unlinkedTasks.length} tasks and issues to link…" value="${esc(S.linkQ)}" style="margin-top:10px">
         <div class="search-results" id="link-results">${linkResults()}</div>` : ''}`, true);
 
-  const reconnect = !S.cfg.google.canModify ? `<div class="ctx glass-inner"><div class="row" style="margin:0"><span>Reconnect Google once so opening an email marks it read in Gmail.</span>
-      <button class="btn tiny primary" data-action="google-reconnect">Reconnect</button></div></div>` : '';
+  const acct = acctOf(m.acct);
+  const reconnect = acct && (!acct.canModify || acct.needsReconnect) ? `<div class="ctx glass-inner"><div class="row" style="margin:0"><span>${acct.needsReconnect ? `Sign-in for ${esc(acct.email)} expired.` : 'Reconnect Google once so opening an email marks it read in Gmail.'}</span>
+      <button class="btn tiny primary" data-action="acct-reconnect" data-id="${esc(acct.id)}">Reconnect</button></div></div>` : '';
   el.innerHTML = `${reconnect}<div class="d-head">
       <h1>${esc(m.subject)}</h1>
       <div class="d-from"><span class="avatar" style="--h:${hue(m.fromAddr)}">${esc(initials(m.fromName))}</span>
-        <span><b>${esc(m.fromName)}</b> <span class="muted">${esc(m.fromAddr)}</span><br><span class="muted">${m.date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}</span></span></div>
-      <div class="row"><button class="btn ghost" data-action="open-link" data-url="${esc(gmailUrl(m.threadId))}">${I.ext}Open in Gmail</button>
+        <span><b>${esc(m.fromName)}</b> <span class="muted">${esc(m.fromAddr)}</span><br><span class="muted">${m.date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })} · to <span class="src ${m.provider}">${providerName(m.provider)}</span> ${esc(m.mailbox)}</span></span></div>
+      <div class="row"><button class="btn ghost" data-action="open-link" data-url="${esc(m.webUrl)}">${I.ext}Open in ${providerName(m.provider)}</button>
         <button class="btn ghost" data-action="mute" data-addr="${esc(m.fromAddr)}">${isNoise(m) ? 'Unmute sender' : 'Mute sender'}</button>
-        ${S.cfg.asana.connected ? '<button class="btn ghost" data-action="create-task">Create Asana task</button>' : ''}</div>
+        ${S.cfg.asana.connected ? '<button class="btn ghost" data-action="create-task">Create Asana task</button>' : ''}
+        ${S.cfg.salesforce.connected ? '<button class="btn ghost" data-action="case-from-mail">Create Salesforce case</button>' : ''}</div>
     </div>
     ${urgCard}
     ${aiCard}
-    ${S.cfg.asana.connected ? linkCard : ''}`;
+    ${tasksOn() ? linkCard : ''}`;
 }
 
 async function renderDetailBody() {
@@ -789,7 +917,7 @@ async function renderDetailBody() {
   el.innerHTML = '<div class="paper loading">Loading…</div>';
   try {
     const b = await loadBody(m);
-    if (S.sel !== m.threadId) return;
+    if (S.sel !== m.key) return;
     const frame = document.createElement('iframe');
     frame.className = 'paper';
     frame.setAttribute('sandbox', 'allow-popups allow-popups-to-escape-sandbox'); // no scripts, no same-origin
@@ -801,10 +929,10 @@ async function renderDetailBody() {
 function renderFocus() {
   const el = $('#focus');
   if (!el) return;
-  if (!S.cfg.asana.connected) { el.innerHTML = '<div class="empty">Connect Asana in Settings to see tasks here.</div>'; return; }
+  if (!tasksOn()) { el.innerHTML = '<div class="empty">Connect Asana or Jira in Settings to see tasks here.</div>'; return; }
   const linked = signalGids();
   const now = new Date();
-  const rated = S.tasks.map((t) => ({ t, s: Urgency.taskSignal(t, linked, now) }));
+  const rated = allTasks().map((t) => ({ t, s: Urgency.taskSignal(t, linked, now) }));
   const sig = rated.filter((x) => x.s.signal).sort((a, b) => a.s.rank - b.s.rank);
   const noise = rated.filter((x) => !x.s.signal);
   const row = ({ t, s }) => `<a href="#" class="focus-item" data-action="goto-task" data-gid="${esc(t.gid)}">
@@ -831,7 +959,7 @@ function itemsByDay() {
     if (allDay) for (let d = evStart(e); d < evEnd(e); d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1)) add(key(d), { kind: 'event', id: e.id, e, allDay, sort: -1 });
     else add(key(evStart(e)), { kind: 'event', id: e.id, e, allDay, sort: +evStart(e) });
   }
-  for (const t of S.tasks) { const d = Urgency.dueDate(t); if (d) add(key(d), { kind: 'task', id: t.gid, t, sort: t.due_at ? +d : Infinity }); }
+  for (const t of allTasks()) { const d = Urgency.dueDate(t); if (d) add(key(d), { kind: 'task', id: t.gid, t, sort: t.due_at ? +d : Infinity }); }
   map.forEach((v) => v.sort((a, b) => a.sort - b.sort));
   return map;
 }
@@ -867,12 +995,12 @@ function renderCalendar() {
   const [y, mo, da] = selKey.split('-').map(Number);
   const selDate = new Date(y, mo - 1, da);
   const dayItems = byDay.get(selKey) || [];
-  const undated = S.tasks.filter((t) => !Urgency.dueDate(t)).length;
+  const undated = allTasks().filter((t) => !Urgency.dueDate(t)).length;
   $('#app').innerHTML = `<section class="cal">
     <div class="pane glass cal-main">
       <div class="cal-head">
         <h2><b>${S.calMonth.toLocaleDateString([], { month: 'long' })}</b> ${S.calMonth.getFullYear()}</h2>
-        <div class="legend"><span class="ldot ev"></span>Calendar<span class="ldot task"></span>Asana due</div>
+        <div class="legend"><span class="ldot ev"></span>Calendar<span class="ldot task"></span>Task due</div>
         ${routineCount ? `<button class="btn tiny ${S.showRoutine ? 'ghost' : 'primary'}" data-action="routine" title="Recurring events such as standups and 1:1s">${S.showRoutine ? 'Hide routine' : `Show routine (${routineCount})`}</button>` : ''}
         ${hiddenCount ? `<button class="btn tiny ${S.showHidden ? 'primary' : 'ghost'}" data-action="show-hidden" title="Events you hid in Workmate Desk">${I.eye}Hidden (${hiddenCount})</button>` : ''}
         <div class="cal-nav"><button class="icon" data-action="cal-prev">${I.back}</button><button class="btn ghost tiny" data-action="cal-today">Today</button><button class="icon" data-action="cal-next">${I.fwd}</button></div>
@@ -898,7 +1026,7 @@ function dayItem(it) {
       const att = (e.attendees || []).filter((a) => !a.self);
       const addrs = new Set(att.map((a) => a.email.toLowerCase()));
       const mails = S.emails.filter((m) => addrs.has(m.fromAddr)).slice(0, 5);
-      const tasks = Urgency.matchTasks({ subject: e.summary || '', snippet: '' }, S.tasks);
+      const tasks = Urgency.matchTasks({ subject: e.summary || '', snippet: '' }, allTasks());
       detail = `<div class="di-detail">
         ${e.location ? `<p>📍 ${esc(e.location)}</p>` : ''}
         <div class="row">${e.hangoutLink ? `<button class="btn tiny" data-action="open-link" data-url="${esc(e.hangoutLink)}">Join Meet</button>` : ''}
@@ -908,7 +1036,7 @@ function dayItem(it) {
           <span class="muted hint-sm">Only in Workmate Desk. Your Google Calendar is not changed.</span></div>
         ${att.length ? `<div class="sub">${att.length} guests</div><p class="muted">${att.slice(0, 8).map((a) => esc(a.displayName || a.email)).join(', ')}${att.length > 8 ? '…' : ''}</p>` : ''}
         ${e.description ? `<p class="desc">${esc(htmlToText(e.description).slice(0, 600))}</p>` : ''}
-        ${mails.length ? `<div class="sub">Recent mail from guests</div>${mails.map((m) => `<a href="#" class="mini-mail" data-action="goto-mail" data-id="${esc(m.threadId)}"><b>${esc(m.fromName)}</b> ${esc(m.subject)}</a>`).join('')}` : ''}
+        ${mails.length ? `<div class="sub">Recent mail from guests</div>${mails.map((m) => `<a href="#" class="mini-mail" data-action="goto-mail" data-id="${esc(m.key)}"><b>${esc(m.fromName)}</b> ${esc(m.subject)}</a>`).join('')}` : ''}
         ${tasks.length ? `<div class="sub">Related tasks</div>${tasks.map((t) => taskRow(t)).join('')}` : ''}
       </div>`;
     }
@@ -918,21 +1046,20 @@ function dayItem(it) {
   const t = it.t;
   let detail = '';
   if (open) {
-    const threads = Object.entries(S.links).filter(([, g]) => g.includes(t.gid)).map(([th]) => th);
-    const mails = S.emails.filter((m) => threads.includes(m.threadId) || relatedTasks(m).some((x) => x.gid === t.gid));
+    const mails = threadsForTask(t.gid);
     detail = `<div class="di-detail">
       ${t.projects?.length ? `<p class="muted">${t.projects.map((p) => esc(p.name)).join(', ')}</p>` : ''}
       ${t.notes ? `<p class="desc">${esc(t.notes.slice(0, 500))}</p>` : ''}
-      <div class="row"><button class="btn tiny" data-action="goto-task" data-gid="${esc(t.gid)}">Open task</button><button class="btn tiny ghost" data-action="open-link" data-url="${esc(t.permalink_url)}">${I.ext}Asana</button></div>
-      ${mails.length ? `<div class="sub">Related mail</div>${mails.map((m) => `<a href="#" class="mini-mail" data-action="goto-mail" data-id="${esc(m.threadId)}"><b>${esc(m.fromName)}</b> ${esc(m.subject)}</a>`).join('')}` : ''}
+      <div class="row"><button class="btn tiny" data-action="goto-task" data-gid="${esc(t.gid)}">Open task</button><button class="btn tiny ghost" data-action="open-link" data-url="${esc(t.permalink_url)}">${I.ext}${isJira(t.gid) ? 'Jira' : 'Asana'}</button></div>
+      ${mails.length ? `<div class="sub">Related mail</div>${mails.map((m) => `<a href="#" class="mini-mail" data-action="goto-mail" data-id="${esc(m.key)}"><b>${esc(m.fromName)}</b> ${esc(m.subject)}</a>`).join('')}` : ''}
     </div>`;
   }
   return `<div class="day-item task ${dueClass(t)} ${open ? 'open' : ''}" data-action="cal-item" data-kind="task" data-id="${esc(it.id)}">
-    <span class="bar"></span><div><div class="di-time">${t.due_at ? fmtTime(new Date(t.due_at)) : 'Due'} · Asana</div><div class="di-title">${esc(t.name)}</div>${detail}</div></div>`;
+    <span class="bar"></span><div><div class="di-time">${t.due_at ? fmtTime(new Date(t.due_at)) : 'Due'} · ${isJira(t.gid) ? 'Jira' : 'Asana'}</div><div class="di-title">${esc(t.name)}</div>${detail}</div></div>`;
 }
 
 // ---------- tasks (Asana boards as set up, plus task detail with comments) ----------
-const threadsForTask = (gid) => S.emails.filter((m) => (S.links[m.threadId] || []).includes(gid) || relatedTasks(m).some((t) => t.gid === gid));
+const threadsForTask = (gid) => S.emails.filter((m) => (S.links[m.key] || []).includes(gid) || relatedTasks(m).some((t) => t.gid === gid));
 
 function taskCard(t) {
   const mails = threadsForTask(t.gid).length;
@@ -958,11 +1085,11 @@ function taskCard(t) {
 function renderBoard() {
   const el = $('#board');
   if (!el) return;
-  if (!S.cfg.asana.connected) { el.innerHTML = '<div class="empty big">Connect Asana in Settings to see your boards.</div>'; return; }
-  const loading = S.boardSrc !== 'my' && (!S.board || S.board.src !== S.boardSrc || S.board.loading);
-  if (loading || (S.loading && !S.tasks.length)) { el.innerHTML = '<div class="empty">Loading board…</div>'; return; }
+  if (!tasksOn()) { el.innerHTML = '<div class="empty big">Connect Asana or Jira in Settings to see your boards.</div>'; return; }
+  const loading = !['my', 'jira'].includes(S.boardSrc) && (!S.board || S.board.src !== S.boardSrc || S.board.loading);
+  if (loading || (S.loading && !allTasks().length)) { el.innerHTML = '<div class="empty">Loading board…</div>'; return; }
   const q = S.taskQ.trim();
-  const cols = (S.boardSrc === 'my' ? myColumns() : S.board.columns)
+  const cols = (S.boardSrc === 'my' ? myColumns() : S.boardSrc === 'jira' ? jiraColumns() : S.board.columns)
     .map((c) => (q ? { ...c, tasks: c.tasks.filter((t) => matchesQuery(t, q)) } : c))
     .filter((c) => !q || c.tasks.length); // while searching, hide columns with no hits
   $('#board-count').textContent = `${cols.reduce((n, c) => n + c.tasks.length, 0)} ${q ? 'found' : 'open'}`;
@@ -973,16 +1100,18 @@ function renderBoard() {
 }
 
 // Board order of preference: the default you starred, else your busiest board; My Tasks only as the last resort
-const homeBoard = () => S.defaultBoard || S.boards[0]?.gid || 'my';
+const homeBoard = () => S.defaultBoard || S.boards[0]?.gid || (S.cfg.asana.connected || !S.cfg.jira.connected ? 'my' : 'jira');
 function boardForTask(gid) {
+  if (isJira(gid)) return 'jira';
   const t = S.tasks.find((x) => x.gid === gid) || (S.board?.columns || []).flatMap((c) => c.tasks).find((x) => x.gid === gid);
   const on = new Set(t ? boardsOf(t).map((p) => p.gid) : []);
   if (on.has(homeBoard())) return homeBoard();
   if (S.boardSrc !== 'my' && on.has(S.boardSrc)) return S.boardSrc; // already looking at a board it's on
   return S.boards.find((b) => on.has(b.gid))?.gid || [...on][0] || 'my';
 }
-const allBoards = () => [...S.boards, { gid: 'my', name: 'My Tasks', n: S.tasks.length }]; // My Tasks is always the last choice
-const boardName = (gid) => allBoards().find((b) => b.gid === gid)?.name || 'My Tasks';
+const allBoards = () => [...S.boards, ...(S.cfg.jira.connected ? [{ gid: 'jira', name: 'Jira: my issues', n: S.jira.length }] : []),
+  ...(S.cfg.asana.connected ? [{ gid: 'my', name: 'My Tasks', n: S.tasks.length }] : [])]; // My Tasks is always the last choice
+const boardName = (gid) => allBoards().find((b) => b.gid === gid)?.name || (gid === 'jira' ? 'Jira: my issues' : 'My Tasks');
 
 function boardList() {
   const q = S.boardQ.toLowerCase().split(/\s+/).filter(Boolean);
@@ -997,7 +1126,7 @@ function boardHeadHtml() {
   return `<div class="board-head"><h2>Tasks</h2>
         <div class="bpick">
           <button class="field board-pick" data-action="board-menu">${esc(boardName(S.boardSrc))} <span class="caret">▾</span></button>
-          ${S.boardMenu ? `<div class="bmenu"><input class="field search" id="board-q" type="search" placeholder="Search ${S.boards.length + 1} boards" value="${esc(S.boardQ)}">
+          ${S.boardMenu ? `<div class="bmenu"><input class="field search" id="board-q" type="search" placeholder="Search ${allBoards().length} boards" value="${esc(S.boardQ)}">
             <div class="bm-list" id="board-list">${boardList()}</div></div>` : ''}
         </div>
         ${S.boardSrc !== homeBoard() ? `<button class="btn tiny ghost" data-action="pick-board" data-gid="${esc(homeBoard())}" title="Back to ${esc(boardName(S.defaultBoard))}">★ Default</button>` : ''}
@@ -1026,6 +1155,7 @@ function renderTasks() {
 }
 
 async function openTask(gid) {
+  if (isJira(gid)) return openJira(gid);
   S.taskSel = gid; S.draft = ''; S.editing = null; S.files = []; S.taskDetail = { gid, loading: true };
   loadAttachments(gid);
   loadTaskTime(gid);
@@ -1086,6 +1216,7 @@ function renderTaskDetailNow() {
   if (!d) { el.innerHTML = '<div class="empty big">Select a task<br><span class="muted">Read the thread, see related mail and comment as yourself.</span></div>'; return; }
   if (d.loading) { el.innerHTML = '<div class="shimmer-lines"><i></i><i></i><i></i></div>'; return; }
   if (d.error) { el.innerHTML = `<div class="empty">${esc(d.error)}</div>`; return; }
+  if (d.jira) { el.innerHTML = jiraDetailHtml(d); return; }
   const t = d.task;
   const mails = threadsForTask(t.gid);
   const sections = (t.memberships || []).filter((m) => m.section).map((m) => `${m.project?.name ? esc(m.project.name) + ' · ' : ''}${esc(m.section.name)}`);
@@ -1103,7 +1234,7 @@ function renderTaskDetailNow() {
     ${attachmentsHtml(t.gid)}
     ${depList('Blocked by', t.dependencies)}
     ${depList('Blocking', t.dependents)}
-    ${mails.length ? `<div class="sub">Related mail</div>${mails.map((m) => `<a href="#" class="mini-mail" data-action="goto-mail" data-id="${esc(m.threadId)}"><b>${esc(m.fromName)}</b> ${esc(m.subject)}</a>`).join('')}` : ''}
+    ${relatedMailHtml(mails)}
     <div class="sub">Comments ${d.comments.length ? d.comments.length : ''}</div>
     ${d.comments.map(commentHtml).join('') || '<p class="muted">No comments yet.</p>'}
     <div class="composer">
@@ -1111,6 +1242,104 @@ function renderTaskDetailNow() {
       <div class="pending" id="pending-files">${pendingHtml()}</div>
       <div class="row end"><label class="btn ghost tiny attach-btn" title="Attach files">${I.clip}Attach<input type="file" id="file-pick" multiple hidden></label><button class="btn primary tiny" data-action="post-comment">Comment</button></div>
     </div>`;
+}
+
+const relatedMailHtml = (mails) => (mails.length ? `<div class="sub">Related mail</div>${mails.map((m) => `<a href="#" class="mini-mail" data-action="goto-mail" data-id="${esc(m.key)}"><b>${esc(m.fromName)}</b> ${esc(m.subject)}</a>`).join('')}` : '');
+
+// ---------- Jira (issues assigned to me, shown as tasks) ----------
+const JIRA_FIELDS = ['summary', 'status', 'duedate', 'updated', 'project', 'assignee'];
+async function loadJira() {
+  if (!S.cfg.jira.connected) { S.jira = []; return; }
+  let out = [], nextPageToken;
+  for (let i = 0; i < 5; i++) { // ponytail: first 500 open issues; raise if someone has more
+    const r = await api.jira('/search/jql', { method: 'POST', body: JSON.stringify({ jql: 'assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC', fields: JIRA_FIELDS, maxResults: 100, nextPageToken }) });
+    out = out.concat(r.issues || []);
+    nextPageToken = r.nextPageToken;
+    if (!nextPageToken || r.isLast) break;
+  }
+  S.jira = out.map((i) => Sources.jiraTask(S.cfg.jira.site, i));
+  S.jiraLoaded = true;
+}
+
+// one column per status, in workflow order: to do, in progress, then done
+const CAT_ORDER = { new: 0, indeterminate: 1, done: 2 };
+function jiraColumns() {
+  const cols = new Map();
+  for (const t of S.jira) {
+    if (!cols.has(t.status)) cols.set(t.status, { gid: t.status, name: t.status, cat: CAT_ORDER[t.statusCat] ?? 1, tasks: [] });
+    cols.get(t.status).tasks.push(t);
+  }
+  return [...cols.values()].sort((a, b) => a.cat - b.cat || a.name.localeCompare(b.name));
+}
+
+async function openJira(gid) {
+  S.taskSel = gid; S.draft = ''; S.files = []; S.taskDetail = { gid, loading: true };
+  renderBoard(); renderTaskDetail();
+  const key = gid.slice(5);
+  try {
+    const [issue, c, tr] = await Promise.all([
+      api.jira(`/issue/${encodeURIComponent(key)}?fields=${JIRA_FIELDS},description,priority,issuetype,reporter&expand=renderedFields`),
+      api.jira(`/issue/${encodeURIComponent(key)}/comment?orderBy=-created&maxResults=50&expand=renderedBody`),
+      api.jira(`/issue/${encodeURIComponent(key)}/transitions`),
+    ]);
+    if (S.taskSel === gid) S.taskDetail = { gid, jira: true, issue, task: Sources.jiraTask(S.cfg.jira.site, issue), comments: c.comments.reverse(), transitions: tr.transitions };
+  } catch (e) { if (S.taskSel === gid) S.taskDetail = { gid, error: clean(e) }; }
+  renderTaskDetail();
+}
+
+// Jira renders rich text to HTML; show it as plain text with its line breaks
+function htmlLines(h) {
+  const d = new DOMParser().parseFromString(h || '', 'text/html');
+  d.querySelectorAll('br').forEach((b) => b.replaceWith('\n'));
+  d.querySelectorAll('p,div,li,h1,h2,h3,h4,h5,h6,tr,pre,blockquote').forEach((b) => b.append('\n'));
+  return d.body.textContent.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function jiraDetailHtml(d) {
+  const t = d.task, f = d.issue.fields;
+  const chip = (x, cls = 'gray') => (x ? `<span class="chip ${cls}">${esc(x)}</span>` : '');
+  return `
+    <h1 class="t-title">${esc(f.summary)}</h1>
+    <div class="chips">${chip(d.issue.key, 'blue')}${chip(f.issuetype?.name)}${chip(f.priority?.name, /highest|high|critical|blocker/i.test(f.priority?.name || '') ? 'orange' : 'gray')}
+      <span class="chip ${dueClass(t) === 'overdue' ? 'red' : dueClass(t) === 'soon' ? 'orange' : 'gray'}">${dueLabel(t)}</span>${chip(f.project?.name, 'blue')}</div>
+    <div class="row"><button class="btn ghost tiny" data-action="open-link" data-url="${esc(t.permalink_url)}">${I.ext}Open in Jira</button></div>
+    <div class="status-grid">
+      <label class="lbl inline"><span class="st-label">Status</span><select class="field" id="jira-transition"><option value="">${esc(f.status?.name)}</option>
+        ${d.transitions.map((x) => `<option value="${esc(x.id)}">${esc(x.name)}${x.to?.name && x.to.name !== x.name ? ' → ' + esc(x.to.name) : ''}</option>`).join('')}</select></label>
+      <label class="lbl inline"><span class="st-label">Assignee</span><span>${esc(f.assignee?.displayName || 'Unassigned')}</span></label>
+      ${f.reporter ? `<label class="lbl inline"><span class="st-label">Reporter</span><span>${esc(f.reporter.displayName)}</span></label>` : ''}
+    </div>
+    ${d.issue.renderedFields?.description ? `<div class="sub">Description</div><p class="t-notes">${esc(htmlLines(d.issue.renderedFields.description))}</p>` : ''}
+    ${relatedMailHtml(threadsForTask(t.gid))}
+    <div class="sub">Comments ${d.comments.length || ''}</div>
+    ${d.comments.map((c) => `<div class="comment"><span class="avatar sm" style="--h:${hue(c.author?.displayName || 'Jira')}">${esc(initials(c.author?.displayName || 'Jira'))}</span>
+      <div><div><b>${esc(c.author?.displayName || 'Jira')}</b> <span class="muted">${fmtShort(new Date(c.created))}</span></div><p>${esc(c.renderedBody ? htmlLines(c.renderedBody) : c.plain || '')}</p></div></div>`).join('') || '<p class="muted">No comments yet.</p>'}
+    <div class="composer">
+      <textarea class="field" id="comment" rows="3" placeholder="Comment as ${esc(S.cfg.jira.user?.name || 'you')}… (Ctrl+Enter to post)">${esc(S.draft)}</textarea>
+      <div class="row end"><button class="btn primary tiny" data-action="post-comment">Comment</button></div>
+    </div>`;
+}
+
+// drag to a column, or pick in the detail: Jira only allows the transitions its workflow offers
+async function transitionJira(gid, pick) {
+  const key = gid.slice(5), t = S.jira.find((x) => x.gid === gid);
+  const { transitions } = await api.jira(`/issue/${encodeURIComponent(key)}/transitions`);
+  const tr = transitions.find(pick);
+  if (!tr) throw new Error(`Jira's workflow has no move from ${t?.status || 'here'} to that status`);
+  await api.jira(`/issue/${encodeURIComponent(key)}/transitions`, { method: 'POST', body: JSON.stringify({ transition: { id: tr.id } }) });
+  if (tr.to?.statusCategory?.key === 'done') S.jira = S.jira.filter((x) => x.gid !== gid); // boards only show open issues
+  else if (t) { t.status = tr.to?.name || t.status; t.statusCat = tr.to?.statusCategory?.key || t.statusCat; }
+  return tr.to?.name || tr.name;
+}
+
+async function moveJira(gid, status) {
+  const t = S.jira.find((x) => x.gid === gid);
+  if (!t || t.status === status) return;
+  try {
+    toast(`Moved to ${await transitionJira(gid, (x) => x.to?.name === status)}`);
+    if (S.taskSel === gid) openJira(gid);
+  } catch (err) { toast(`Couldn't move it: ${clean(err)}`); }
+  renderBoard();
 }
 
 // ---------- Everhour timer ----------
@@ -1183,6 +1412,7 @@ document.addEventListener('drop', (e) => {
 
 // optimistic: move it on screen first, then tell Asana; put it back if Asana says no
 async function moveTask(gid, sectionGid) {
+  if (isJira(gid)) return moveJira(gid, sectionGid);
   const my = S.boardSrc === 'my';
   const cols = my ? null : S.board.columns;
   const task = S.tasks.find((t) => t.gid === gid);
@@ -1286,7 +1516,7 @@ function addFiles(list) {
   }
 }
 document.addEventListener('paste', (e) => {
-  if (e.target.id !== 'comment' || !e.clipboardData?.files?.length) return;
+  if (e.target.id !== 'comment' || !e.clipboardData?.files?.length || isJira(S.taskSel)) return;
   if (!e.clipboardData.getData('text')) e.preventDefault(); // a pure picture/file paste: don't also paste text
   addFiles(e.clipboardData.files);
 });
@@ -1298,7 +1528,7 @@ document.addEventListener('dragover', (e) => {
 document.addEventListener('dragleave', (e) => { if (!e.relatedTarget?.closest?.('.composer')) document.querySelectorAll('.composer.drop').forEach((c) => c.classList.remove('drop')); });
 document.addEventListener('drop', (e) => {
   const c = e.target.closest?.('.composer');
-  if (!c || !e.dataTransfer?.files?.length) return;
+  if (!c || !e.dataTransfer?.files?.length || isJira(S.taskSel)) return;
   e.preventDefault(); c.classList.remove('drop'); addFiles(e.dataTransfer.files);
 });
 function showLightbox(src, name) {
@@ -1338,21 +1568,25 @@ function notify(title, body, onClick) {
   n.onclick = () => { api.showWindow(); onClick(); };
 }
 
-// After each refresh: tasks newly assigned to me, and urgent unread mail not announced before.
-// The first run only records what exists, so you aren't flooded on day one.
-function checkNotices() {
-  const first = store.get('seenTasks') === null;
-  if (S.tasksLoaded) {
-    const seen = new Set(store.get('seenTasks') || []);
-    const fresh = S.tasks.filter((t) => !seen.has(t.gid));
-    if (!first && fresh.length === 1) notify('New Asana task for you', fresh[0].name, () => actions['goto-task']({ dataset: { gid: fresh[0].gid } }, noEvt));
-    else if (!first && fresh.length > 1) notify(`${fresh.length} new Asana tasks for you`, fresh.slice(0, 3).map((t) => t.name).join('\n'), () => { S.view = 'tasks'; S.boardSrc = 'my'; render(); });
-    store.set('seenTasks', S.tasks.map((t) => t.gid));
+// After each refresh: tasks and Jira issues newly assigned to me, and urgent unread mail not announced before.
+// The first run of each only records what exists, so you aren't flooded on day one.
+function noticeNew(storeKey, list, label) {
+  const prev = store.get(storeKey);
+  if (prev) {
+    const seen = new Set(prev), fresh = list.filter((t) => !seen.has(t.gid));
+    if (fresh.length === 1) notify(`New ${label} for you`, fresh[0].name, () => actions['goto-task']({ dataset: { gid: fresh[0].gid } }, noEvt));
+    else if (fresh.length > 1) notify(`${fresh.length} new ${label}s for you`, fresh.slice(0, 3).map((t) => t.name).join('\n'), () => { S.view = 'tasks'; render(); });
   }
+  store.set(storeKey, list.map((t) => t.gid));
+}
+function checkNotices() {
+  if (S.tasksLoaded) noticeNew('seenTasks', S.tasks, 'Asana task');
+  if (S.jiraLoaded) noticeNew('seenJira', S.jira, 'Jira issue');
+  const first = store.get('seenUrgent') === null;
   const told = new Set(store.get('seenUrgent') || []);
-  const urgent = heads(S.emails).filter((m) => m.u?.level === 'urgent' && m.labelIds.includes('UNREAD') && !isNoise(m) && !told.has(m.threadId));
-  if (!first) for (const m of urgent.slice(0, 3)) notify(`Urgent: ${m.fromName}`, m.subject, () => actions['goto-mail']({ dataset: { id: m.threadId } }, noEvt));
-  store.set('seenUrgent', [...told, ...urgent.map((m) => m.threadId)].slice(-500));
+  const urgent = heads(S.emails).filter((m) => m.u?.level === 'urgent' && m.labelIds.includes('UNREAD') && !isNoise(m) && !told.has(m.key));
+  if (!first) for (const m of urgent.slice(0, 3)) notify(`Urgent: ${m.fromName}`, m.subject, () => actions['goto-mail']({ dataset: { id: m.key } }, noEvt));
+  store.set('seenUrgent', [...told, ...urgent.map((m) => m.key)].slice(-500));
 }
 
 // ---------- resizable panes (drag the edge; double-click resets) ----------
@@ -1400,7 +1634,7 @@ function renderWidget() {
   const upcoming = S.events.filter((e) => evEnd(e) > now && evStart(e) - now < DAY && !e.start.date && !declined(e) && !isHiddenEv(e)).sort((a, b) => evStart(a) - evStart(b));
   const urgent = heads(S.emails).filter((m) => m.u && m.u.level !== 'normal' && !isNoise(m)).sort((a, b) => b.u.score - a.u.score);
   const linked = signalGids();
-  const due = S.tasks.map((t) => ({ t, s: Urgency.taskSignal(t, linked, now) })).filter((x) => x.s.signal && x.s.rank <= 3).sort((a, b) => a.s.rank - b.s.rank);
+  const due = allTasks().map((t) => ({ t, s: Urgency.taskSignal(t, linked, now) })).filter((x) => x.s.signal && x.s.rank <= 3).sort((a, b) => a.s.rank - b.s.rank);
   const when = (e) => {
     const mins = Math.round((evStart(e) - now) / 60000);
     return mins <= 0 ? 'Now' : mins < 60 ? `in ${mins} min` : sameDay(evStart(e), now) ? fmtTime(evStart(e)) : `Tomorrow ${fmtTime(evStart(e))}`;
@@ -1412,9 +1646,9 @@ function renderWidget() {
       ${wList(upcoming, (e, i) => `<div class="w-ev ${i === 0 ? 'first' : ''}"><span class="w-when">${when(e)}</span><span class="w-ev-name">${esc(e.summary || '(busy)')}</span>
         ${e.hangoutLink ? `<button class="btn tiny" data-action="open-link" data-url="${esc(e.hangoutLink)}">Join</button>` : ''}</div>`, 'No more meetings today')}</div>
     <div class="glass w-card"><h3>Needs attention <span class="count">${urgent.length || ''}</span></h3>
-      ${wList(urgent, (m) => `<button class="w-mail lv-${m.u.level}" data-action="goto-mail" data-id="${esc(m.threadId)}"><span class="avatar sm" style="--h:${hue(m.fromAddr)}">${esc(initials(m.fromName))}</span>
-        <span><b>${esc(m.fromName)}</b><span class="muted">${esc(S.ai[m.id]?.summary || m.subject)}</span></span></button>`, 'Inbox is calm')}</div>
-    ${S.cfg.asana.connected ? `<div class="glass w-card"><h3>Due soon <span class="count orange">${due.length || ''}</span></h3>
+      ${wList(urgent, (m) => `<button class="w-mail lv-${m.u.level}" data-action="goto-mail" data-id="${esc(m.key)}"><span class="avatar sm" style="--h:${hue(m.fromAddr)}">${esc(initials(m.fromName))}</span>
+        <span><b>${esc(m.fromName)}</b><span class="muted">${esc(S.ai[aiKey(m)]?.summary || m.subject)}</span></span></button>`, 'Inbox is calm')}</div>
+    ${tasksOn() ? `<div class="glass w-card"><h3>Due soon <span class="count orange">${due.length || ''}</span></h3>
       ${wList(due, ({ t, s }) => `<a href="#" class="focus-item" data-action="goto-task" data-gid="${esc(t.gid)}"><span class="tdot ${dueClass(t)}"></span><span><span class="fi-name">${esc(t.name)}</span><span class="muted">${esc(s.why)}</span></span></a>`, 'Nothing due')}</div>` : ''}
     <div class="w-more">${I.down}<span>More below</span></div>
   </section>`;
@@ -1442,6 +1676,143 @@ document.addEventListener('scroll', (e) => {
   if (el.classList?.contains('widget')) markWidgetMore();
 }, true);
 
+// ---------- Salesforce Cases ----------
+const sfq = (soql) => api.sf(`/query?q=${encodeURIComponent(soql)}`);
+const CASE_FIELDS = 'Id, CaseNumber, Subject, Status, Priority, IsClosed, OwnerId, Owner.Name, Account.Name, Contact.Name, LastModifiedDate';
+const CASE_SCOPES = [['mine', 'My open'], ['open', 'All open'], ['all', 'All']];
+const caseUrl = (id) => `${S.cfg.salesforce.instanceUrl}/lightning/r/Case/${id}/view`;
+const prioTone = (p) => (/critical|urgent/i.test(p || '') ? 'red' : /high/i.test(p || '') ? 'orange' : 'gray');
+const later = (fn, ms = 350) => { let t; return () => { clearTimeout(t); t = setTimeout(fn, ms); }; };
+
+async function loadCases() {
+  const c = S.cases, seq = (c.seq = (c.seq || 0) + 1);
+  const where = [];
+  if (c.scope === 'mine') where.push(`OwnerId = '${Sources.soql(S.cfg.salesforce.user?.id || '')}'`);
+  if (c.scope !== 'all') where.push('IsClosed = false');
+  const q = c.q.trim();
+  if (q) where.push(`(Subject LIKE '%${Sources.soqlLike(q)}%' OR CaseNumber LIKE '%${Sources.soqlLike(q)}%')`);
+  c.loading = true; renderCases();
+  try {
+    const r = await sfq(`SELECT ${CASE_FIELDS} FROM Case${where.length ? ' WHERE ' + where.join(' AND ') : ''} ORDER BY LastModifiedDate DESC LIMIT 200`);
+    if (seq !== c.seq) return; // a newer search is on its way
+    c.list = r.records; c.error = '';
+  } catch (e) { if (seq !== c.seq) return; c.error = clean(e); }
+  c.loading = false; c.loaded = true;
+  renderCases();
+}
+const searchCasesSoon = later(loadCases);
+
+// Status and Priority choices are set up per org, so read them from Salesforce once
+async function caseMeta() {
+  if (!S.cases.meta) {
+    const d = await api.sf('/sobjects/Case/describe');
+    const values = (n) => d.fields.find((f) => f.name === n)?.picklistValues || [];
+    const pick = (n) => values(n).filter((v) => v.active).map((v) => v.value);
+    S.cases.meta = { status: pick('Status'), priority: pick('Priority'), defPriority: values('Priority').find((v) => v.defaultValue)?.value || '' };
+  }
+  return S.cases.meta;
+}
+
+async function openCase(id) {
+  if (!Sources.sfId(id)) return;
+  const c = S.cases;
+  c.sel = id; c.form = null; c.draft = ''; c.ownerQ = ''; c.owners = []; c.detail = { id, loading: true };
+  renderCases();
+  try {
+    const [rec, com] = await Promise.all([
+      sfq(`SELECT ${CASE_FIELDS}, Description, Type, ContactEmail FROM Case WHERE Id = '${id}'`),
+      sfq(`SELECT Id, CommentBody, CreatedDate, CreatedBy.Name, IsPublished FROM CaseComment WHERE ParentId = '${id}' ORDER BY CreatedDate ASC LIMIT 200`),
+      caseMeta(),
+    ]);
+    if (!rec.records.length) throw new Error('This case no longer exists, or you lost access to it');
+    if (c.sel === id) c.detail = { id, rec: rec.records[0], comments: com.records };
+  } catch (e) { if (c.sel === id) c.detail = { id, error: clean(e) }; }
+  renderCases();
+}
+
+async function patchCase(fields, msg) {
+  const id = S.cases.detail.id;
+  await api.sf(`/sobjects/Case/${id}`, { method: 'PATCH', body: JSON.stringify(fields) });
+  toast(msg);
+  openCase(id); loadCases();
+}
+
+async function searchOwners() {
+  const c = S.cases, q = c.ownerQ.trim();
+  const r = q ? await sfq(`SELECT Id, Name FROM User WHERE IsActive = true AND UserType = 'Standard' AND Name LIKE '%${Sources.soqlLike(q)}%' ORDER BY Name LIMIT 8`).catch((e) => { toast(clean(e)); return { records: [] }; }) : { records: [] };
+  if (q !== c.ownerQ.trim()) return;
+  c.owners = r.records;
+  const el = $('#owner-results'); if (el) el.innerHTML = ownerResults();
+}
+const searchOwnersSoon = later(searchOwners, 300);
+const ownerResults = () => S.cases.owners.map((u) => `<div class="task-row"><span class="tr-main">${esc(u.Name)}</span><button class="btn tiny" data-action="case-owner" data-id="${esc(u.Id)}" data-name="${esc(u.Name)}">Assign</button></div>`).join('')
+  || (S.cases.ownerQ.trim() ? '<p class="muted">Nobody matches</p>' : '');
+
+const caseItem = (r) => `<button class="mail-item ${S.cases.sel === r.Id ? 'sel' : ''}" data-action="open-case" data-id="${esc(r.Id)}">
+    <span class="mi"><span class="mi-top"><span class="mi-from">${esc(r.CaseNumber)}${r.Account?.Name ? ' · ' + esc(r.Account.Name) : ''}</span><span class="mi-time">${fmtShort(new Date(r.LastModifiedDate))}</span></span>
+      <span class="mi-subj">${esc(r.Subject || '(no subject)')}</span>
+      <span class="chips"><span class="chip ${r.IsClosed ? 'green' : 'blue'}">${esc(r.Status)}</span>${r.Priority ? `<span class="chip ${prioTone(r.Priority)}">${esc(r.Priority)}</span>` : ''}${r.Owner?.Name ? `<span class="chip gray">${esc(r.Owner.Name)}</span>` : ''}</span></span></button>`;
+
+function caseDetailHtml() {
+  const c = S.cases, f = c.form;
+  if (f) {
+    return `<h1 class="t-title">New case</h1>
+      ${f.fromMail ? `<p class="muted">From the email “${esc(f.fromMail)}”</p>` : ''}
+      <label class="lbl">Subject<input class="field" id="case-subject" data-case-form="Subject" value="${esc(f.Subject)}"></label>
+      <label class="lbl">Description<textarea class="field" id="case-desc" data-case-form="Description" rows="8">${esc(f.Description)}</textarea></label>
+      <label class="lbl">Priority<select class="field" id="case-prio" data-case-form="Priority">${(c.meta?.priority || []).map((p) => `<option ${p === f.Priority ? 'selected' : ''}>${esc(p)}</option>`).join('')}</select></label>
+      <div class="row end"><button class="btn ghost" data-action="case-cancel">Cancel</button><button class="btn primary" data-action="case-save">Create case</button></div>`;
+  }
+  const d = c.detail;
+  if (!d) return '<div class="empty big">Select a case<br><span class="muted">Change its status, priority or owner, and comment as yourself.</span></div>';
+  if (d.loading) return '<div class="shimmer-lines"><i></i><i></i><i></i></div>';
+  if (d.error) return `<div class="empty">${esc(d.error)}</div>`;
+  const r = d.rec;
+  const pick = (field, opts) => `<label class="lbl inline"><span class="st-label">${field}</span><select class="field" data-case-field="${field}">
+      ${[...new Set([r[field], ...opts].filter(Boolean))].map((o) => `<option ${o === r[field] ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></label>`;
+  return `<h1 class="t-title">${esc(r.Subject || '(no subject)')}</h1>
+    <div class="chips"><span class="chip blue">Case ${esc(r.CaseNumber)}</span>${r.Type ? `<span class="chip gray">${esc(r.Type)}</span>` : ''}${r.Account?.Name ? `<span class="chip gray">${esc(r.Account.Name)}</span>` : ''}
+      ${r.Contact?.Name ? `<span class="chip gray">${esc(r.Contact.Name)}${r.ContactEmail ? ' · ' + esc(r.ContactEmail) : ''}</span>` : ''}</div>
+    <div class="row"><button class="btn ghost tiny" data-action="open-link" data-url="${esc(caseUrl(r.Id))}">${I.ext}Open in Salesforce</button></div>
+    <div class="status-grid">
+      ${pick('Status', c.meta.status)}
+      ${pick('Priority', c.meta.priority)}
+      <label class="lbl inline"><span class="st-label">Owner</span><span class="grow">${esc(r.Owner?.Name || '')}</span>${r.OwnerId !== S.cfg.salesforce.user?.id ? '<button class="btn tiny ghost" data-action="case-take">Assign to me</button>' : ''}</label>
+      <input class="field search wide" id="owner-q" type="search" placeholder="Reassign: search people by name" value="${esc(c.ownerQ)}">
+      <div class="search-results wide" id="owner-results">${ownerResults()}</div>
+    </div>
+    ${r.Description ? `<div class="sub">Description</div><p class="t-notes">${esc(r.Description)}</p>` : ''}
+    <div class="sub">Comments ${d.comments.length || ''}</div>
+    ${d.comments.map((x) => `<div class="comment"><span class="avatar sm" style="--h:${hue(x.CreatedBy?.Name || 'Salesforce')}">${esc(initials(x.CreatedBy?.Name || 'Salesforce'))}</span>
+      <div><div><b>${esc(x.CreatedBy?.Name || 'Salesforce')}</b> <span class="muted">${fmtShort(new Date(x.CreatedDate))}${x.IsPublished ? ' · public' : ''}</span></div><p>${esc(x.CommentBody || '')}</p></div></div>`).join('') || '<p class="muted">No comments yet.</p>'}
+    <div class="composer">
+      <textarea class="field" id="case-comment" rows="3" placeholder="Internal comment as ${esc(S.cfg.salesforce.user?.name || 'you')}… (Ctrl+Enter to post)">${esc(c.draft)}</textarea>
+      <div class="row end"><button class="btn primary tiny" data-action="case-comment">Comment</button></div>
+    </div>`;
+}
+
+// list and detail redraw in place: typing in a search or comment box keeps focus, the detail keeps its scroll
+function renderCases() {
+  if (S.view !== 'cases' || S.ui.widget) return;
+  if (!$('.cases')) {
+    $('#app').innerHTML = `<section class="cases">
+      <div class="pane glass list-pane"><div class="pane-head" id="cases-head"></div><div class="scroll" id="cases-list"></div>${resizer('w-list', 'right')}</div>
+      <div class="pane glass detail-pane"><div class="scroll" id="case-detail"></div></div></section>`;
+  }
+  const c = S.cases;
+  keepFocus($('#cases-head'), () => {
+    $('#cases-head').innerHTML = `<div class="ph-row"><h2>Cases</h2><button class="btn tiny primary" data-action="case-new">New case</button></div>
+      <input class="field search" id="case-q" type="search" placeholder="Search subject or case number" value="${esc(c.q)}">
+      <div class="seg small">${CASE_SCOPES.map(([v, l]) => `<button class="${c.scope === v ? 'on' : ''}" data-action="case-scope" data-scope="${v}">${l}</button>`).join('')}</div>`;
+  });
+  $('#cases-list').innerHTML = c.error ? `<div class="empty">${esc(c.error)}</div>` : !c.loaded ? '<div class="empty">Loading cases…</div>'
+    : c.list.map(caseItem).join('') || '<div class="empty">No cases here</div>';
+  const pane = $('#case-detail'), for_ = c.form ? 'form' : c.sel || '';
+  const y = pane.dataset.for === for_ ? pane.scrollTop : 0;
+  keepFocus(pane, () => { pane.innerHTML = caseDetailHtml(); });
+  pane.dataset.for = for_; pane.scrollTop = y;
+}
+
 // ---------- render ----------
 function render() {
   document.body.classList.toggle('is-widget', !!S.ui.widget && S.view !== 'setup');
@@ -1455,6 +1826,7 @@ function render() {
   }
   if (S.ui.widget) { app.innerHTML = renderWidget(); fitWidgetLists(); return; }
   if (S.view === 'calendar') { renderCalendar(); return; }
+  if (S.view === 'cases') { renderCases(); return; }
   // already showing Tasks or Mail: update in place so the open task/email keeps its scroll, focus and draft
   if (S.view === 'tasks') { renderTasks(); return; }
   if ($('.mail')) { renderList(); renderDetailHead(); renderFocus(); if (S.bodyFor !== S.sel) renderDetailBody(); return; }
@@ -1468,27 +1840,30 @@ function refreshPanes() {
   if (S.ui.widget) { $('#app').innerHTML = renderWidget(); fitWidgetLists(); return; }
   if (S.view === 'calendar') { renderCalendar(); return; }
   if (S.view === 'tasks') { renderBoard(); return; }
+  if (S.view === 'cases') return;
   renderList(); renderDetailHead(); renderFocus();
 }
 
-// Opening an email marks its whole thread read in Gmail, like Gmail itself does.
+// Opening an email marks its whole conversation read in its own mailbox, like Gmail and Outlook do.
 async function markRead(m) {
-  if (!m.labelIds.includes('UNREAD') || !S.cfg.google.canModify) return;
+  if (!m.labelIds.includes('UNREAD') || !acctOf(m.acct)?.canModify) return;
   m.labelIds = m.labelIds.filter((l) => l !== 'UNREAD'); // optimistic
   rescore(); refreshPanes();
+  const json = (method, body) => ({ method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   try {
-    await api.google(`${GMAIL}/threads/${m.threadId}/modify`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ removeLabelIds: ['UNREAD'] }),
-    });
+    if (m.provider === 'microsoft') {
+      const r = await api.mail(m.acct, `${GRAPH}/messages?$filter=conversationId eq ${odataStr(m.threadId)} and isRead eq false&$select=id&$top=50`);
+      await Promise.all((r.value || []).map((x) => api.mail(m.acct, `${GRAPH}/messages/${encodeURIComponent(x.id)}`, json('PATCH', { isRead: true }))));
+    } else await api.mail(m.acct, `${GMAIL}/threads/${m.threadId}/modify`, json('POST', { removeLabelIds: ['UNREAD'] }));
   } catch (e) {
     m.labelIds.push('UNREAD'); rescore(); refreshPanes();
     toast(`Couldn't mark as read: ${clean(e)}`);
   }
 }
 
-function openMail(threadId) {
-  if (S.sel !== threadId) S.linkQ = '';
-  S.sel = threadId;
+function openMail(key) {
+  if (S.sel !== key) S.linkQ = '';
+  S.sel = key;
   renderList(); renderDetailHead(); renderDetailBody();
   const m = selectedEmail();
   if (m) { analyze(m); groupOf(m).forEach(markRead); }
@@ -1503,6 +1878,7 @@ async function busy(btn, label, fn) {
 const actions = {
   tab: (el) => {
     S.view = el.dataset.tab;
+    if (S.view === 'cases' && !S.cases.loaded && !S.cases.loading) loadCases();
     // first visit to Tasks this session opens the default board
     if (S.view === 'tasks' && !S.boardOpened) { S.boardOpened = true; if (homeBoard() !== 'my') { renderTitlebar(); loadBoard(homeBoard()); return; } }
     render();
@@ -1516,12 +1892,28 @@ const actions = {
   'google-connect': (el) => busy(el, 'Waiting for browser…', async () => {
     S.cfg = await api.googleConnect($('#g-id').value, $('#g-secret').value); render();
   }),
-  'google-disconnect': async () => { S.cfg = await api.googleDisconnect(); render(); },
-  // same saved client ID/secret, new consent with the mark-as-read permission
-  'google-reconnect': (el) => busy(el, 'Waiting for browser…', async () => {
-    S.cfg = await api.googleConnect('', '');
-    const m = selectedEmail(); renderDetailHead(); if (m) markRead(m);
+  'ms-connect': (el) => busy(el, 'Waiting for browser…', async () => { S.cfg = await api.msConnect($('#ms-id').value, $('#ms-tenant').value); render(); }),
+  // same app credentials, fresh consent; also how an expired sign-in comes back
+  'acct-reconnect': (el) => busy(el, 'Waiting for browser…', async () => {
+    S.cfg = await api.accountReconnect(el.dataset.id);
+    if (S.view === 'setup') { render(); return; }
+    renderDetailHead(); const m = selectedEmail(); if (m) markRead(m);
   }),
+  'acct-remove': async (el) => {
+    const id = el.dataset.id;
+    S.cfg = await api.accountRemove(id);
+    S.emails = S.emails.filter((m) => m.acct !== id); delete S.mailNext[id];
+    if (S.acctFilter === id) S.acctFilter = '';
+    render();
+  },
+  'jira-connect': (el) => busy(el, 'Checking…', async () => { S.cfg = await api.jiraConnect($('#j-site').value, $('#j-email').value, $('#j-token').value); render(); }),
+  'jira-disconnect': async () => { S.cfg = await api.jiraDisconnect(); S.jira = []; S.jiraLoaded = false; if (S.boardSrc === 'jira') S.boardSrc = 'my'; render(); },
+  'sf-connect': (el) => busy(el, 'Waiting for browser…', async () => { S.cfg = await api.sfConnect($('#sf-id').value, $('#sf-login').value); render(); }),
+  'sf-disconnect': async () => {
+    S.cfg = await api.sfDisconnect();
+    Object.assign(S.cases, { list: [], loaded: false, sel: null, detail: null, form: null, meta: null });
+    render();
+  },
   'asana-connect': (el) => busy(el, 'Checking…', async () => { S.cfg = await api.asanaConnect($('#a-pat').value); S.utl = null; render(); }),
   'asana-disconnect': async () => { S.cfg = await api.asanaDisconnect(); S.tasks = []; S.boards = []; S.utl = null; render(); },
   'ai-connect': (el) => busy(el, 'Checking…', async () => { S.cfg = await api.aiConnect($('#ai-key').value); render(); }),
@@ -1554,18 +1946,18 @@ const actions = {
     rescore(); refreshPanes();
   },
   reanalyze: () => { const m = selectedEmail(); if (m) analyze(m, true); },
-  link: (el) => { const m = selectedEmail(); S.linkQ = ''; setLinks(m.threadId, [...(S.links[m.threadId] || []), el.dataset.gid]); },
-  unlink: (el) => { const m = selectedEmail(); setLinks(m.threadId, (S.links[m.threadId] || []).filter((g) => g !== el.dataset.gid)); },
+  link: (el) => { const m = selectedEmail(); S.linkQ = ''; setLinks(m.key, [...(S.links[m.key] || []), el.dataset.gid]); },
+  unlink: (el) => { const m = selectedEmail(); setLinks(m.key, (S.links[m.key] || []).filter((g) => g !== el.dataset.gid)); },
   'create-task': (el) => busy(el, 'Creating…', async () => {
     const m = selectedEmail();
     const name = el.dataset.name || m.subject.replace(/^((re|fwd?|fw)\s*:\s*)+/i, '');
-    const notes = `From: ${m.from}\nSubject: ${m.subject}\nGmail: ${gmailUrl(m.threadId)}\n\n${S.ai[m.id]?.summary || m.snippet}`;
+    const notes = `From: ${m.from}\nSubject: ${m.subject}\n${providerName(m.provider)}: ${m.webUrl}\n\n${S.ai[aiKey(m)]?.summary || m.snippet}`;
     const r = await api.asana('/tasks?opt_fields=name,due_on,due_at,notes,permalink_url,modified_at,projects.name', {
       method: 'POST',
       body: JSON.stringify({ data: { name, notes, assignee: S.cfg.asana.user.gid, workspace: S.cfg.asana.workspaceGid } }),
     });
     S.tasks.push(r.data);
-    await setLinks(m.threadId, [...(S.links[m.threadId] || []), r.data.gid]);
+    await setLinks(m.key, [...(S.links[m.key] || []), r.data.gid]);
     toast(`Created “${name}” in Asana and linked it`);
   }),
   noise: () => { S.showNoise = !S.showNoise; renderFocus(); },
@@ -1623,8 +2015,8 @@ const actions = {
   'everhour-connect': (el) => busy(el, 'Checking…', async () => { S.cfg = await api.everhourConnect($('#eh-key').value); render(); }),
   'everhour-disconnect': async () => { S.cfg = await api.everhourDisconnect(); S.timer = null; render(); },
   'load-more': (el) => busy(el, 'Loading…', async () => {
-    const r = await fetchMail(50, S.mailNext, new Set(S.emails.map((m) => m.threadId)));
-    S.emails.push(...r.emails); S.mailNext = r.next;
+    const r = await fetchMail(50, S.mailNext, new Set(S.emails.map((m) => m.key)));
+    S.emails = [...S.emails, ...r.emails].sort((x, y) => y.date - x.date); S.mailNext = { ...S.mailNext, ...r.next };
     rescore(); renderList(); renderFocus();
   }),
   mute: async (el) => {
@@ -1674,6 +2066,13 @@ const actions = {
   'post-comment': (el) => busy(el, S.files.length ? 'Uploading…' : 'Posting…', async () => {
     const gid = S.taskSel, files = [...S.files];
     let text = $('#comment').value.trim();
+    if (isJira(gid)) {
+      if (!text) throw new Error('Write a comment first');
+      const r = await api.jira(`/issue/${encodeURIComponent(gid.slice(5))}/comment?expand=renderedBody`, { method: 'POST', body: JSON.stringify({ body: Sources.adf(text) }) });
+      if (S.taskDetail?.gid === gid) { S.taskDetail.comments.push({ ...r, plain: text }); S.draft = ''; renderTaskDetail(); }
+      toast('Comment posted to Jira');
+      return;
+    }
     if (!text && !files.length) throw new Error('Write a comment or attach a file first');
     for (const f of files) await api.upload(gid, { name: f.name, type: f.type, base64: f.base64 });
     if (files.length) { text += `${text ? '\n\n' : ''}📎 Attached: ${files.map((f) => f.name).join(', ')}`; S.files = []; loadAttachments(gid); }
@@ -1683,6 +2082,46 @@ const actions = {
     if (S.taskDetail?.gid === gid) { S.taskDetail.comments.push(r.data); S.draft = ''; renderTaskDetail(); }
     toast('Comment posted to Asana');
   }),
+
+  'open-case': (el) => openCase(el.dataset.id),
+  'case-scope': (el) => { S.cases.scope = el.dataset.scope; loadCases(); },
+  'case-new': async () => {
+    try { await caseMeta(); } catch (e) { toast(clean(e)); return; }
+    S.cases.form = { Subject: '', Description: '', Priority: S.cases.meta.defPriority };
+    renderCases(); $('#case-subject')?.focus();
+  },
+  'case-cancel': () => { S.cases.form = null; renderCases(); },
+  'case-save': (el) => busy(el, 'Creating…', async () => {
+    const f = S.cases.form;
+    if (!f.Subject.trim()) throw new Error('Give the case a subject');
+    const r = await api.sf('/sobjects/Case', { method: 'POST', body: JSON.stringify({ Subject: f.Subject.trim(), Description: f.Description, Priority: f.Priority || undefined }) });
+    S.cases.form = null;
+    toast('Case created in Salesforce');
+    loadCases(); openCase(r.id);
+  }),
+  'case-take': (el) => busy(el, 'Assigning…', () => patchCase({ OwnerId: S.cfg.salesforce.user.id }, 'Case assigned to you')),
+  'case-owner': (el) => busy(el, 'Assigning…', () => patchCase({ OwnerId: el.dataset.id }, `Case assigned to ${el.dataset.name}`)),
+  'case-comment': (el) => busy(el, 'Posting…', async () => {
+    const id = S.cases.detail.id, text = $('#case-comment').value.trim();
+    if (!text) throw new Error('Write a comment first');
+    await api.sf('/sobjects/CaseComment', { method: 'POST', body: JSON.stringify({ ParentId: id, CommentBody: text }) });
+    S.cases.draft = '';
+    toast('Comment posted to Salesforce');
+    openCase(id);
+  }),
+  'case-from-mail': async () => {
+    const m = selectedEmail();
+    if (!m) return;
+    let meta;
+    try { meta = await caseMeta(); } catch (e) { toast(clean(e)); return; }
+    const urgent = m.u?.level === 'urgent' && meta.priority.find((p) => /critical|urgent|high/i.test(p));
+    S.cases.form = {
+      Subject: m.subject.replace(/^((re|fwd?|fw)\s*:\s*)+/i, ''), fromMail: m.subject, Priority: urgent || meta.defPriority,
+      Description: `From: ${m.from}\nReceived: ${m.date.toLocaleString()} in ${m.mailbox}\n${providerName(m.provider)}: ${m.webUrl}\n\n${S.ai[aiKey(m)]?.summary || m.snippet}`,
+    };
+    S.view = 'cases'; render();
+    if (!S.cases.loaded) loadCases();
+  },
 
   'cal-prev': async () => { S.calMonth = new Date(S.calMonth.getFullYear(), S.calMonth.getMonth() - 1, 1); renderCalendar(); await loadEvents().catch((e) => toast(clean(e))); renderCalendar(); },
   'cal-next': async () => { S.calMonth = new Date(S.calMonth.getFullYear(), S.calMonth.getMonth() + 1, 1); renderCalendar(); await loadEvents().catch((e) => toast(clean(e))); renderCalendar(); },
@@ -1723,11 +2162,25 @@ document.addEventListener('input', (e) => {
   if (e.target.id === 'link-q') { S.linkQ = e.target.value; $('#link-results').innerHTML = linkResults(); }
   if (e.target.id === 'task-q') { S.taskQ = e.target.value; renderBoard(); }
   if (e.target.id === 'board-q') { S.boardQ = e.target.value; $('#board-list').innerHTML = boardList(); }
+  if (e.target.id === 'case-q') { S.cases.q = e.target.value; searchCasesSoon(); }
+  if (e.target.id === 'owner-q') { S.cases.ownerQ = e.target.value; searchOwnersSoon(); }
+  if (e.target.id === 'case-comment') S.cases.draft = e.target.value;
+  if (e.target.dataset?.caseForm && S.cases.form) S.cases.form[e.target.dataset.caseForm] = e.target.value;
 });
 document.addEventListener('change', async (e) => {
   if (e.target.id === 'a-ws') { S.cfg = await api.asanaWorkspace(e.target.value); S.utl = null; }
   if (e.target.id === 'login') { S.ui = await api.openAtLogin(e.target.checked); }
   if (e.target.id === 'notify') store.set('notify', e.target.checked);
+  if (e.target.id === 'acct-filter') { S.acctFilter = e.target.value; store.set('acctFilter', S.acctFilter); renderList(); }
+  if (e.target.id === 'jira-transition' && e.target.value) {
+    const gid = S.taskDetail.gid, id = e.target.value;
+    transitionJira(gid, (x) => x.id === id).then((name) => { toast(`Moved to ${name}`); renderBoard(); openJira(gid); })
+      .catch((err) => { toast(`Couldn't move it: ${clean(err)}`); renderTaskDetail(); });
+  }
+  if (e.target.dataset?.caseField) {
+    const f = e.target.dataset.caseField, v = e.target.value;
+    patchCase({ [f]: v }, `${f}: ${v}`).catch((err) => { toast(`Couldn't change it: ${clean(err)}`); renderCases(); });
+  }
   if (e.target.dataset?.secProject) {
     const t = S.taskDetail.task, pg = e.target.dataset.secProject, sec = e.target.value;
     const m = t.memberships.find((x) => x.project?.gid === pg), before = m.section;
@@ -1767,12 +2220,13 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && S.boardMenu) { S.boardMenu = false; renderTasks(); return; }
   if (e.target.id === 'board-q' && e.key === 'Enter') { $('#board-list .bm-row')?.click(); return; }
   if (e.target.id === 'comment' && e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); $('[data-action=post-comment]')?.click(); return; }
+  if (e.target.id === 'case-comment' && e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); $('[data-action=case-comment]')?.click(); return; }
   if (S.view !== 'mail' || S.ui.widget || e.target.matches('input,select,textarea')) return;
   if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
   const { list } = visibleEmails();
-  const i = list.findIndex((m) => m.threadId === S.sel);
+  const i = list.findIndex((m) => m.key === S.sel);
   const n = list[Math.max(0, Math.min(list.length - 1, i + (e.key === 'ArrowDown' ? 1 : -1)))];
-  if (n) { e.preventDefault(); openMail(n.threadId); document.querySelector('.mail-item.sel')?.scrollIntoView({ block: 'nearest' }); }
+  if (n) { e.preventDefault(); openMail(n.key); document.querySelector('.mail-item.sel')?.scrollIntoView({ block: 'nearest' }); }
 });
 
 // ---------- boot ----------
@@ -1793,6 +2247,11 @@ still();
   S.showRoutine = store.get('showRoutine') ?? true;
   S.hiddenEv = store.get('hiddenEvents') || { ids: [], series: [] };
   S.defaultBoard = store.get('defaultBoard') || null;
+  S.acctFilter = store.get('acctFilter') || '';
+  if (!acctOf(S.acctFilter)) S.acctFilter = '';
+  // urgent-mail notices recorded before multi-account used bare Gmail thread ids
+  const seen = store.get('seenUrgent'), g = primaryGoogle();
+  if (g && seen?.some((k) => !k.includes('|'))) store.set('seenUrgent', seen.map((k) => (k.includes('|') ? k : Sources.mailKey(g.id, k))));
   S.pic = await api.wallpaper();
   applyTheme();
   api.onUi((ui) => { S.ui = ui; render(); });
@@ -1800,11 +2259,11 @@ still();
   api.onTimerChanged(() => loadTimer().then(timerChanged).catch(() => {}));
   // the Command Palette dock asked to open a task (or just Workmate Desk)
   api.onOpenTask((gid) => { if (gid) actions['goto-task']({ dataset: { gid } }, noEvt); });
-  S.view = S.cfg.google.connected ? 'mail' : 'setup';
+  S.view = S.cfg.accounts.length ? 'mail' : 'setup';
   render();
-  if (S.cfg.google.connected) loadAll();
+  if (S.cfg.accounts.length) loadAll();
   // refresh only while the window is visible; catch up when it comes back
-  const due = () => S.cfg.google.connected && S.view !== 'setup' && !document.hidden && Date.now() - S.lastLoad > 3 * 60 * 1000;
+  const due = () => S.cfg.accounts.length && S.view !== 'setup' && !document.hidden && Date.now() - S.lastLoad > 3 * 60 * 1000;
   setInterval(() => { if (due()) loadAll(); }, 60 * 1000);
   document.addEventListener('visibilitychange', () => { if (due()) loadAll(); });
 })();

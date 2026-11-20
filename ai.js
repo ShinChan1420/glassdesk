@@ -18,15 +18,15 @@ const Analysis = z.object({
     task_gid: z.string(),
     confidence: z.enum(['high', 'medium', 'low']),
     reason: z.string().describe('Why this email relates to the task, in one sentence'),
-  })).describe('Asana tasks this email relates to, best first. Empty if none fit.'),
+  })).describe('Tasks or Jira issues this email relates to, best first. Empty if none fit.'),
   new_task: z.object({
     suggested: z.boolean(),
     name: z.string().describe('Task name to create if suggested, else empty'),
   }),
 });
 
-const SYSTEM = `You help a busy professional triage email against their Asana tasks.
-You get one email and their open Asana tasks. Decide:
+const SYSTEM = `You help a busy professional triage email against their open tasks (Asana tasks and Jira issues).
+You get one email and those tasks. Decide:
 - which tasks (if any) the email is about. Only suggest a task when the email clearly concerns the same work: shared project, deliverable, client, or people. Do not suggest weak keyword overlaps. An empty list is a good answer.
 - how urgent the email is for the user. Use the tasks' due dates and today's date: an email about a task due today or overdue is urgent. Newsletters, notifications and FYIs are low.
 - whether the email asks for work that has no task yet, and if so a short task name.
@@ -50,9 +50,9 @@ function userContent({ email, tasks, today }) {
   }));
   return `Today is ${today}.
 
-<asana_tasks>
+<tasks>
 ${JSON.stringify(taskList)}
-</asana_tasks>
+</tasks>
 
 <email>
 From: ${email.from}
